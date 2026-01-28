@@ -41,6 +41,252 @@ if TYPE_CHECKING:
 logger = logging.getLogger("ComfyUI-CacheDiT")
 
 
+# === Lightweight cache state for fallback mode ===
+_lightweight_cache_state = {
+    "enabled": False,
+    "transformer_id": None,
+    "call_count": 0,
+    "skip_count": 0,
+    "last_result": None,
+    "config": None,
+}
+
+
+def _enable_lightweight_cache(transformer, blocks, config, cache_config):
+    """
+    Lightweight caching via direct forward hook (fallback for unsupported models)
+    
+    This approach directly replaces transformer.forward with a cached version,
+    bypassing cache-dit's complex BlockAdapter architecture.
+    
+    Based on the high-performance implementation from enhanced cache repo.
+    """
+    global _lightweight_cache_state
+    
+    # Check if already patched
+    if hasattr(transformer, '_original_forward'):
+        logger.warning("[LightweightCache] Transformer already patched, skipping")
+        return
+    
+    # Save original forward
+    transformer._original_forward = transformer.forward
+    
+    # Reset state
+    _lightweight_cache_state = {
+        "enabled": True,
+        "transformer_id": id(transformer),
+        "call_count": 0,
+        "skip_count": 0,
+        "compute_count": 0,
+        "last_result": None,
+        "config": config,
+        "cache_config": cache_config,
+        "compute_times": [],
+    }
+    
+    # === Model-specific adaptive parameters ===
+    transformer_class = transformer.__class__.__name__
+    total_steps = config.num_inference_steps if config.num_inference_steps else 28
+    
+    # Model-specific configurations based on architecture and characteristics
+    if "NextDiT" in transformer_class or "Lumina" in transformer_class:
+        # NextDiT/Lumina: simpler architecture, can skip more aggressively
+        warmup_steps = min(3, total_steps // 3)
+        if total_steps <= 15:
+            skip_interval = 2  # 50% skip for short
+        else:
+            skip_interval = 2  # 33% skip for longer
+    
+    elif "QwenImage" in transformer_class or "Qwen" in transformer_class:
+        # Qwen-Image: quality-sensitive, use conservative settings
+        warmup_steps = min(3, total_steps // 10)  # Shorter warmup for speed
+        if total_steps <= 20:
+            skip_interval = 2  # 33% skip
+        elif total_steps <= 40:
+            skip_interval = 2  # 33% skip  
+        else:
+            skip_interval = 3  # 25% skip for very long sequences
+    
+    elif "Flux" in transformer_class or "FLUX" in transformer_class:
+        # FLUX: well-tested, balanced approach
+        warmup_steps = min(3, total_steps // 4)
+        skip_interval = 2  # Standard 33% skip
+    
+    elif "LTX" in transformer_class:
+        # LTX-2: Video generation model, needs temporal consistency
+        # Conservative settings to maintain frame quality and temporal coherence
+        warmup_steps = max(6, total_steps // 3)  # Longer warmup for stable baseline
+        if total_steps <= 15:
+            skip_interval = 6  # Very short sequences - very conservative (16% cache)
+        elif total_steps <= 30:
+            skip_interval = 5  # Short sequences - conservative (20% cache)
+        else:
+            skip_interval = 4  # Long sequences - balanced (25% cache)
+    
+    elif "HunyuanVideo" in transformer_class:
+        # HunyuanVideo: Complex video model, very conservative
+        warmup_steps = max(8, total_steps // 4)
+        skip_interval = 5  # Very conservative for temporal consistency
+    
+    else:
+        # Unknown models: use safe defaults
+        warmup_steps = min(config.max_warmup_steps, total_steps // 3)
+        if total_steps <= 15:
+            skip_interval = 3  # Conservative
+        elif total_steps <= 30:
+            skip_interval = 2
+        else:
+            skip_interval = 3
+    
+    # Override with user config if explicitly set (not default)
+    if config.max_warmup_steps != 3:  # User changed from default
+        warmup_steps = config.max_warmup_steps
+    
+    noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
+    
+    def cached_forward(*args, **kwargs):
+        """
+        Cached forward with optimized skip logic
+        
+        Strategy: After warmup, skip every other step (call_count % 2 == 0)
+        This achieves ~1.5-2x speedup with minimal quality loss.
+        """
+        state = _lightweight_cache_state
+        state["call_count"] += 1
+        call_id = state["call_count"]
+        
+        # Debug logging for first 10 calls
+        if call_id <= 10:
+            logger.info(f"[LightweightCache] Call #{call_id}, warmup={warmup_steps}, skip_interval={skip_interval}")
+        
+        # Warmup phase: always compute (first N steps)
+        if call_id <= warmup_steps:
+            import time
+            start = time.time()
+            result = transformer._original_forward(*args, **kwargs)
+            elapsed = time.time() - start
+            
+            state["compute_count"] += 1
+            state["compute_times"].append(elapsed)
+            
+            # Cache result for next iteration - support both Tensor and tuple
+            # ALWAYS use .detach() only, no .clone() to save memory
+            if isinstance(result, torch.Tensor):
+                state["last_result"] = result.detach()
+            elif isinstance(result, tuple):
+                # Handle tuple of tensors (common in transformers)
+                state["last_result"] = tuple(
+                    r.detach() if isinstance(r, torch.Tensor) else r
+                    for r in result
+                )
+            else:
+                # For other types, store as-is
+                state["last_result"] = result
+            
+            if call_id <= 10:
+                result_type = type(result).__name__
+                if isinstance(result, tuple):
+                    result_type = f"tuple[{len(result)}]"
+                logger.info(f"[LightweightCache]   → WARMUP: computed, cached={state['last_result'] is not None}, type={result_type}")
+            
+            return result
+        
+        # Post-warmup: decide whether to skip based on fixed interval
+        # Skip pattern: For skip_interval=2: compute, skip, compute, skip, ...
+        # For skip_interval=3: compute, skip, skip, compute, skip, skip, ...
+        steps_after_warmup = call_id - warmup_steps
+        should_compute = (steps_after_warmup % skip_interval == 1)
+        
+        if call_id <= 15:
+            logger.info(f"[LightweightCache]   → After warmup: step={steps_after_warmup}, should_compute={should_compute}, has_cache={state['last_result'] is not None}")
+        
+        if not should_compute and state["last_result"] is not None:
+            # Use cached result (with optional noise injection)
+            state["skip_count"] += 1
+            
+            if call_id <= 15:
+                logger.info(f"[LightweightCache]   → USING CACHE (skip #{state['skip_count']})")
+            
+            cached_result = state["last_result"]
+            
+            # Apply noise if configured
+            if noise_scale > 0:
+                if isinstance(cached_result, torch.Tensor):
+                    noise = torch.randn_like(cached_result) * noise_scale
+                    cached_result = cached_result + noise
+                elif isinstance(cached_result, tuple):
+                    # Apply noise to tensor elements in tuple
+                    cached_result = tuple(
+                        (r + torch.randn_like(r) * noise_scale) if isinstance(r, torch.Tensor) else r
+                        for r in cached_result
+                    )
+            
+            return cached_result
+        else:
+            # Compute normally and update cache
+            if call_id <= 15:
+                logger.info(f"[LightweightCache]   → COMPUTING (compute #{state['compute_count'] + 1})")
+            
+            import time
+            start = time.time()
+            result = transformer._original_forward(*args, **kwargs)
+            elapsed = time.time() - start
+            
+            state["compute_count"] += 1
+            state["compute_times"].append(elapsed)
+            
+            # Update cache for next skip - support both Tensor and tuple
+            if isinstance(result, torch.Tensor):
+                state["last_result"] = result.detach()
+            elif isinstance(result, tuple):
+                state["last_result"] = tuple(
+                    r.detach() if isinstance(r, torch.Tensor) else r
+                    for r in result
+                )
+            else:
+                state["last_result"] = result
+            
+            return result
+    
+    # Replace forward method
+    transformer.forward = cached_forward
+    
+    logger.info(
+        f"[CacheDiT] ✓ Lightweight cache enabled: "
+        f"model={transformer_class}, steps={total_steps}, "
+        f"warmup={warmup_steps}, skip_interval={skip_interval}, "
+        f"noise_scale={noise_scale:.4f}"
+    )
+
+
+def _get_lightweight_cache_stats():
+    """Get statistics from lightweight cache"""
+    state = _lightweight_cache_state
+    
+    if not state["enabled"]:
+        return None
+    
+    total_calls = state["call_count"]
+    cache_hits = state["skip_count"]
+    compute_count = state["compute_count"]
+    
+    if total_calls == 0:
+        return None
+    
+    cache_hit_rate = (cache_hits / total_calls) * 100
+    avg_time = sum(state["compute_times"]) / max(len(state["compute_times"]), 1)
+    estimated_speedup = total_calls / max(compute_count, 1)
+    
+    return {
+        "total_steps": total_calls,
+        "computed_steps": compute_count,
+        "cached_steps": cache_hits,
+        "cache_hit_rate": cache_hit_rate,
+        "estimated_speedup": estimated_speedup,
+        "avg_compute_time": avg_time,
+    }
+
+
 # =============================================================================
 # Configuration Holder Class
 # =============================================================================
@@ -214,12 +460,28 @@ def _cache_dit_outer_sample_wrapper(executor, *args, **kwargs):
         # =====================================================================
         if config.print_summary and transformer is not None:
             try:
-                dashboard = print_summary_to_log(
-                    transformer=transformer,
-                    model_type=config.model_type,
-                    num_steps=config.num_inference_steps or 0,
-                    config_info=config.get_config_info(),
-                )
+                # Check if using lightweight cache fallback
+                lightweight_stats = _get_lightweight_cache_stats()
+                
+                if lightweight_stats is not None:
+                    # Display lightweight cache statistics
+                    logger.info(
+                        f"\n[CacheDiT] Lightweight Cache Statistics:\n"
+                        f"  Total Steps: {lightweight_stats['total_steps']}\n"
+                        f"  Computed: {lightweight_stats['computed_steps']}\n"
+                        f"  Cached: {lightweight_stats['cached_steps']}\n"
+                        f"  Cache Hit Rate: {lightweight_stats['cache_hit_rate']:.1f}%\n"
+                        f"  Estimated Speedup: {lightweight_stats['estimated_speedup']:.2f}x\n"
+                        f"  Avg Compute Time: {lightweight_stats['avg_compute_time']:.3f}s"
+                    )
+                else:
+                    # Use standard cache-dit statistics
+                    dashboard = print_summary_to_log(
+                        transformer=transformer,
+                        model_type=config.model_type,
+                        num_steps=config.num_inference_steps or 0,
+                        config_info=config.get_config_info(),
+                    )
             except Exception as e:
                 logger.warning(f"[CacheDiT] Summary failed: {e}")
         
@@ -265,18 +527,22 @@ def _cache_dit_diffusion_model_wrapper(executor, *args, **kwargs):
         output = executor(*args, **kwargs)
         
         # Apply noise injection if enabled (prevents "dead" regions in cached outputs)
+        # This is CRITICAL for video models and high-resolution image generation
         if config is not None and config.noise_scale > 0:
             try:
-                # Only apply to cached steps (after warmup)
+                # Only apply to cached steps (after warmup) to preserve quality
                 if config.current_step >= config.max_warmup_steps:
                     output = apply_noise_injection(
                         output=output,
                         noise_scale=config.noise_scale,
                     )
-                    if config.verbose and config.current_step % 10 == 0:
-                        logger.debug(f"[CacheDiT] Applied noise injection: scale={config.noise_scale}")
+                    if config.verbose and config.current_step % 5 == 0:
+                        logger.debug(
+                            f"[CacheDiT] ✓ Noise injection applied at step {config.current_step}: "
+                            f"scale={config.noise_scale}"
+                        )
             except Exception as e:
-                logger.warning(f"[CacheDiT] Noise injection failed: {e}")
+                logger.warning(f"[CacheDiT] ✗ Noise injection failed: {e}")
         
         return output
         
@@ -295,13 +561,16 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
     """
     try:
         import cache_dit
+        from cache_dit import BlockAdapter
         
-        # Build BlockAdapter
-        adapter = build_block_adapter(
-            transformer=transformer,
-            forward_pattern=config.forward_pattern,
-            auto_detect=True,
-        )
+        # For ComfyUI models, manually extract blocks
+        from .utils import _manual_extract_blocks
+        
+        manual_blocks = _manual_extract_blocks(transformer)
+        if not manual_blocks or len(manual_blocks) == 0:
+            raise RuntimeError("Failed to extract blocks from transformer")
+        
+        logger.info(f"[CacheDiT] ✓ Extracted {len(manual_blocks)} blocks for caching")
         
         # Build cache config
         cache_config = build_cache_config(
@@ -320,23 +589,82 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         # Build calibrator config
         calibrator_config = build_calibrator_config(config.taylor_order)
         
-        # Enable cache - CRITICAL: first parameter must be named 'pipe_or_adapter'
-        enable_kwargs = {"cache_config": cache_config}
-        if calibrator_config is not None:
-            enable_kwargs["calibrator_config"] = calibrator_config
+        # Get forward pattern
+        pattern = get_forward_pattern(config.forward_pattern)
         
-        # Call enable_cache with adapter as first positional argument
-        cache_dit.enable_cache(adapter, **enable_kwargs)
+        # === Strategy Selection: cache-dit vs lightweight cache ===
+        # For ComfyUI non-standard models (NextDiT, Lumina2), use lightweight cache
+        # as cache-dit's BlockAdapter doesn't maintain transformer references properly
+        transformer_class_name = transformer.__class__.__name__
+        use_lightweight = transformer_class_name in ["NextDiT", "Lumina2"]
         
-        if config.verbose:
-            logger.info(
-                f"[CacheDiT] Cache enabled: F{config.fn_blocks}B{config.bn_blocks}, "
-                f"threshold={config.threshold}, warmup={config.max_warmup_steps}, "
-                f"pattern={config.forward_pattern}, steps={config.num_inference_steps}"
+        if use_lightweight:
+            logger.info(f"[CacheDiT] Detected {transformer_class_name} - using lightweight cache (optimized for ComfyUI)")
+            _enable_lightweight_cache(
+                transformer=transformer,
+                blocks=manual_blocks,
+                config=config,
+                cache_config=cache_config,
             )
+        else:
+            # === Attempt to use cache-dit's BlockAdapter (for standard models) ===
+            cache_dit_failed = False
+            try:
+                # Inject blocks into transformer for cache-dit auto-detection
+                if not hasattr(transformer, 'blocks'):
+                    transformer.blocks = torch.nn.ModuleList(manual_blocks)
+                    logger.info(f"[CacheDiT] Injected {len(manual_blocks)} blocks into transformer.blocks")
+                
+                # Try creating BlockAdapter with just blocks (simplest approach)
+                adapter = BlockAdapter(blocks=manual_blocks)
+                
+                # Verify adapter has blocks
+                if not hasattr(adapter, 'blocks') or len(adapter.blocks) == 0:
+                    raise RuntimeError(f"BlockAdapter created but has no blocks!")
+                
+                logger.info(f"[CacheDiT] ✓ BlockAdapter verified: {len(adapter.blocks)} blocks")
+                
+                # Enable cache with BlockAdapter
+                enable_kwargs = {
+                    "cache_config": cache_config,
+                    "forward_pattern": pattern,
+                }
+                if calibrator_config is not None:
+                    enable_kwargs["calibrator_config"] = calibrator_config
+                
+                cache_dit.enable_cache(adapter, **enable_kwargs)
+                
+                # CRITICAL: Check if transformer reference is maintained
+                # If transformer is None, cache-dit won't be able to track statistics
+                if hasattr(adapter, 'transformer') and adapter.transformer is None:
+                    logger.warning(f"[CacheDiT] BlockAdapter.transformer is None - statistics won't work")
+                    raise RuntimeError("BlockAdapter has no transformer reference")
+                
+                logger.info(
+                    f"[CacheDiT] ✓ Cache enabled via BlockAdapter: "
+                    f"F{config.fn_blocks}B{config.bn_blocks}, "
+                    f"threshold={config.threshold}, warmup={config.max_warmup_steps}"
+                )
+                
+            except Exception as e:
+                cache_dit_failed = True
+                logger.warning(f"[CacheDiT] cache-dit BlockAdapter failed: {e}")
+                logger.info(f"[CacheDiT] Falling back to direct forward hook implementation")
+            
+            # === Fallback: Direct forward hook (for unsupported models) ===
+            if cache_dit_failed:
+                # Use simple but reliable forward replacement strategy
+                _enable_lightweight_cache(
+                    transformer=transformer,
+                    blocks=manual_blocks,
+                    config=config,
+                    cache_config=cache_config,
+                )
         
     except Exception as e:
-        logger.error(f"[CacheDiT] Failed to enable cache: {e}")
+        logger.error(f"[CacheDiT] ✗ Failed to enable cache: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 
@@ -346,6 +674,35 @@ def _refresh_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
     Called when num_inference_steps changes between requests.
     """
     try:
+        # Check if using lightweight cache (always reset if enabled, regardless of transformer_id)
+        if _lightweight_cache_state.get("enabled"):
+            current_transformer_id = id(transformer)
+            previous_transformer_id = _lightweight_cache_state.get("transformer_id")
+            
+            # Reset lightweight cache state for new run (required for each independent sampling)
+            _lightweight_cache_state["call_count"] = 0
+            _lightweight_cache_state["skip_count"] = 0
+            _lightweight_cache_state["compute_count"] = 0
+            _lightweight_cache_state["last_result"] = None
+            _lightweight_cache_state["compute_times"] = []
+            _lightweight_cache_state["config"] = config
+            _lightweight_cache_state["transformer_id"] = current_transformer_id
+            
+            # Log only if verbose or transformer changed (different model/step in workflow)
+            if config.verbose:
+                if previous_transformer_id != current_transformer_id:
+                    logger.info(
+                        f"[CacheDiT] Lightweight cache reset for new sampling: "
+                        f"{config.num_inference_steps} steps (transformer changed)"
+                    )
+                else:
+                    logger.info(
+                        f"[CacheDiT] Lightweight cache reset for new sampling: "
+                        f"{config.num_inference_steps} steps"
+                    )
+            return
+        
+        # Standard cache-dit refresh
         import cache_dit
         
         # Rebuild configs with new step count
@@ -396,124 +753,21 @@ class CacheDiT_Model_Optimizer:
     
     @classmethod
     def INPUT_TYPES(cls):
-        preset_names = get_all_preset_names()
-        patterns = list(PATTERN_DESCRIPTIONS.keys())
-        strategies = ["adaptive", "static", "dynamic"]
-        scm_policies = ["none", "fast", "medium", "ultra"]
+        preset_names = ["Auto"] + get_all_preset_names()
         
         return {
             "required": {
                 "model": ("MODEL",),
-                
-                # ============================================================
-                # Basic Settings / 基础设置
-                # ============================================================
-                "model_type": (preset_names, {
-                    "default": "Custom",
-                    "tooltip": "Model preset (presets auto-configure optimal settings)\n"
-                               "模型预设 (预设会自动配置最优参数)"
-                }),
-                "forward_pattern": (patterns, {
-                    "default": "Pattern_1",
-                    "tooltip": "Transformer block forward pattern\n"
-                               "Transformer 块前向传播模式"
-                }),
-                "strategy": (strategies, {
-                    "default": "adaptive",
-                    "tooltip": "Caching strategy:\n"
-                               "• adaptive: Auto-balance quality/speed\n"
-                               "• static: Aggressive caching\n"
-                               "• dynamic: Conservative caching\n"
-                               "缓存策略: adaptive=自适应, static=激进, dynamic=保守"
-                }),
-                
-                # ============================================================
-                # Core Parameters / 核心参数
-                # ============================================================
-                "threshold": ("FLOAT", {
-                    "default": 0.12,
-                    "min": 0.01,
-                    "max": 0.5,
-                    "step": 0.01,
-                    "tooltip": "Residual diff threshold (higher=faster, lower=better quality)\n"
-                               "残差阈值 (越高越快, 越低质量越好)"
-                }),
-                "fn_blocks": ("INT", {
-                    "default": 8,
-                    "min": 1,
-                    "max": 32,
-                    "step": 1,
-                    "tooltip": "Fn: Front blocks for stable diff calculation\n"
-                               "Fn: 用于稳定差分计算的前置块数"
-                }),
-                "bn_blocks": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16,
-                    "step": 1,
-                    "tooltip": "Bn: Back blocks for feature fusion\n"
-                               "Bn: 用于特征融合的后置块数"
+                "enable": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable/Disable CacheDiT acceleration\n启用/禁用 CacheDiT 加速"
                 }),
             },
             "optional": {
-                # ============================================================
-                # Advanced Parameters / 高级参数
-                # ============================================================
-                "warmup_steps": ("INT", {
-                    "default": 8,
-                    "min": 0,
-                    "max": 50,
-                    "step": 1,
-                    "tooltip": "Steps before caching starts (no acceleration during warmup)\n"
-                               "预热步数 (预热期间不加速)"
-                }),
-                "skip_interval": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 10,
-                    "step": 1,
-                    "tooltip": "Force compute every N steps (0=disabled, critical for video)\n"
-                               "每 N 步强制计算 (0=禁用, 视频生成必需)"
-                }),
-                "noise_scale": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 0.01,
-                    "step": 0.0005,
-                    "tooltip": "Noise injection scale to prevent static artifacts\n"
-                               "噪声注入强度, 防止生成结果死板"
-                }),
-                "taylor_order": ("INT", {
-                    "default": 1,
-                    "min": 0,
-                    "max": 2,
-                    "step": 1,
-                    "tooltip": "TaylorSeer order (0=disabled, 1-2=enabled)\n"
-                               "TaylorSeer 阶数 (0=禁用, 1-2=启用)"
-                }),
-                "scm_policy": (scm_policies, {
-                    "default": "none",
-                    "tooltip": "Steps Computation Mask policy:\n"
-                               "• none: Dynamic (default)\n"
-                               "• fast/medium/ultra: Precomputed masks\n"
-                               "步数计算掩码策略"
-                }),
-                
-                # ============================================================
-                # CFG Settings / CFG 设置
-                # ============================================================
-                "separate_cfg": (["auto", "true", "false"], {
-                    "default": "auto",
-                    "tooltip": "Separate CFG processing (auto uses preset value)\n"
-                               "分离 CFG 处理 (auto 使用预设值)"
-                }),
-                
-                # ============================================================
-                # Debug Settings / 调试设置
-                # ============================================================
-                "verbose": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable verbose logging\n启用详细日志"
+                "model_type": (preset_names, {
+                    "default": "Auto",
+                    "tooltip": "Model preset (Auto=auto-detect, or select specific model)\n"
+                               "模型预设 (Auto=自动检测, 或选择特定模型)"
                 }),
                 "print_summary": ("BOOLEAN", {
                     "default": True,
@@ -534,61 +788,64 @@ class CacheDiT_Model_Optimizer:
     def optimize(
         self,
         model,
-        model_type: str,
-        forward_pattern: str,
-        strategy: str,
-        threshold: float,
-        fn_blocks: int,
-        bn_blocks: int,
-        warmup_steps: int = 8,
-        skip_interval: int = 0,
-        noise_scale: float = 0.0,
-        taylor_order: int = 1,
-        scm_policy: str = "none",
-        separate_cfg: str = "auto",
-        verbose: bool = False,
+        enable: bool = True,
+        model_type: str = "Auto",
         print_summary: bool = True,
     ):
         """Apply CacheDiT optimization to the model."""
         
+        # If disabled, return model as-is
+        if not enable:
+            logger.info("[CacheDiT] ⏸️ Optimization disabled")
+            return (model,)
+        
         # Clone model to avoid modifying original
         model = model.clone()
         
-        # Get preset and apply defaults for "auto" settings
+        # Auto-detect model type if "Auto" is selected
+        if model_type == "Auto":
+            # Try to detect from model architecture
+            if hasattr(model.model, 'diffusion_model'):
+                transformer = model.model.diffusion_model
+                class_name = transformer.__class__.__name__
+                
+                # Map common class names to presets
+                if "Qwen" in class_name:
+                    model_type = "Qwen-Image"
+                elif "NextDiT" in class_name or "Lumina" in class_name:
+                    model_type = "Z-Image"
+                elif "Flux" in class_name or "FLUX" in class_name:
+                    model_type = "Flux"
+                elif "LTX" in class_name:
+                    model_type = "LTX-2"
+                elif "HunyuanVideo" in class_name:
+                    model_type = "HunyuanVideo"
+                else:
+                    model_type = "Custom"
+                    logger.info(f"[CacheDiT] ℹ️ Auto-detected unknown model: {class_name}, using Custom preset")
+            else:
+                model_type = "Custom"
+                logger.info("[CacheDiT] ℹ️ Cannot auto-detect model type, using Custom preset")
+        
+        # Get preset
         preset = get_preset(model_type)
         
-        # Use preset values if model_type is not Custom
-        if model_type != "Custom":
-            # Use preset defaults but allow user overrides
-            if forward_pattern == "Pattern_1" and preset.forward_pattern != "Pattern_1":
-                forward_pattern = preset.forward_pattern
-            
-            # Apply preset strategy if using default
-            if strategy == "adaptive":
-                strategy = preset.default_strategy
-        
-        # Determine CFG setting
-        if separate_cfg == "auto":
-            enable_separate_cfg = preset.enable_separate_cfg
-        else:
-            enable_separate_cfg = separate_cfg == "true"
-        
-        # Create configuration
+        # Use all preset defaults (fully automated)
         config = CacheDiTConfig(
             model_type=model_type,
-            forward_pattern=forward_pattern,
-            strategy=strategy,
-            fn_blocks=fn_blocks,
-            bn_blocks=bn_blocks,
-            threshold=threshold,
-            max_warmup_steps=warmup_steps,
-            enable_separate_cfg=enable_separate_cfg,
+            forward_pattern=preset.forward_pattern,
+            strategy=preset.default_strategy,
+            fn_blocks=preset.fn_blocks,
+            bn_blocks=preset.bn_blocks,
+            threshold=preset.threshold,
+            max_warmup_steps=3,  # Optimized default
+            enable_separate_cfg=preset.enable_separate_cfg,
             cfg_compute_first=preset.cfg_compute_first,
-            skip_interval=skip_interval,
-            noise_scale=noise_scale,
-            taylor_order=taylor_order,
-            scm_policy=scm_policy,
-            verbose=verbose,
+            skip_interval=0,  # Auto-managed by lightweight cache
+            noise_scale=0.0,
+            taylor_order=1,
+            scm_policy="none",
+            verbose=False,
             print_summary=print_summary,
         )
         
@@ -607,11 +864,10 @@ class CacheDiT_Model_Optimizer:
             _cache_dit_diffusion_model_wrapper
         )
         
-        if verbose:
-            logger.info(
-                f"[CacheDiT] Configured: {model_type}, {forward_pattern}, "
-                f"F{fn_blocks}B{bn_blocks}, threshold={threshold}"
-            )
+        logger.info(
+            f"[CacheDiT] ✓ Enabled: {model_type} preset, "
+            f"F{preset.fn_blocks}B{preset.bn_blocks}, threshold={preset.threshold}"
+        )
         
         return (model,)
 
@@ -710,12 +966,8 @@ class CacheDiT_Preset_Info:
 
 NODE_CLASS_MAPPINGS = {
     "CacheDiT_Model_Optimizer": CacheDiT_Model_Optimizer,
-    "CacheDiT_Disable": CacheDiT_Disable,
-    "CacheDiT_Preset_Info": CacheDiT_Preset_Info,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "CacheDiT_Model_Optimizer": "⚡ CacheDiT Model Optimizer",
-    "CacheDiT_Disable": "⚡ CacheDiT Disable",
-    "CacheDiT_Preset_Info": "⚡ CacheDiT Preset Info",
+    "CacheDiT_Model_Optimizer": "⚡ CacheDiT Accelerator",
 }

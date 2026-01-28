@@ -437,8 +437,80 @@ def build_calibrator_config(taylor_order: int):
 
 
 # =============================================================================
-# BlockAdapter Construction
+# BlockAdapter Construction - Manual Block Extraction for ComfyUI Models
 # =============================================================================
+
+def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.nn.Module]]:
+    """
+    Manually extract transformer blocks from ComfyUI models.
+    
+    This is necessary because cache-dit's auto-detection fails on non-diffusers
+    architectures like NextDiT (Z-Image/Lumina), Flux, LTX-2, etc.
+    
+    Returns:
+        List of blocks if found, None otherwise
+    """
+    blocks = []
+    transformer_class = transformer.__class__.__name__.lower()
+    
+    logger.info(f"[CacheDiT] Attempting manual block extraction from: {transformer.__class__.__module__}.{transformer.__class__.__name__}")
+    
+    # Strategy 1: Z-Image / Lumina2 (NextDiT architecture)
+    # These models store blocks in .layers attribute
+    if hasattr(transformer, 'layers'):
+        layers = transformer.layers
+        if isinstance(layers, (list, torch.nn.ModuleList)):
+            blocks = list(layers)
+            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .layers (NextDiT/Lumina2 style)")
+            return blocks
+        elif isinstance(layers, torch.nn.Sequential):
+            blocks = list(layers.children())
+            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .layers Sequential")
+            return blocks
+    
+    # Strategy 2: Flux (dual-block architecture)
+    # Flux has .double_blocks and .single_blocks
+    if hasattr(transformer, 'double_blocks') or hasattr(transformer, 'single_blocks'):
+        if hasattr(transformer, 'double_blocks'):
+            double_blocks = transformer.double_blocks
+            if isinstance(double_blocks, (list, torch.nn.ModuleList)):
+                blocks.extend(list(double_blocks))
+        if hasattr(transformer, 'single_blocks'):
+            single_blocks = transformer.single_blocks
+            if isinstance(single_blocks, (list, torch.nn.ModuleList)):
+                blocks.extend(list(single_blocks))
+        if blocks:
+            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks (Flux dual-block style)")
+            return blocks
+    
+    # Strategy 3: LTX-2 / HunyuanVideo / Standard DiT
+    # These models typically have .blocks or .transformer_blocks
+    for attr_name in ['blocks', 'transformer_blocks', 'dit_blocks']:
+        if hasattr(transformer, attr_name):
+            attr_blocks = getattr(transformer, attr_name)
+            if isinstance(attr_blocks, (list, torch.nn.ModuleList)):
+                blocks = list(attr_blocks)
+                logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .{attr_name}")
+                return blocks
+            elif isinstance(attr_blocks, torch.nn.Sequential):
+                blocks = list(attr_blocks.children())
+                logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .{attr_name} Sequential")
+                return blocks
+    
+    # Strategy 4: Deep search in named_children
+    # Last resort: search for ModuleList or Sequential containing blocks
+    logger.info(f"[CacheDiT] Standard attributes not found, performing deep search...")
+    for name, module in transformer.named_children():
+        if isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)):
+            # Check if this looks like a block container
+            children = list(module.children()) if isinstance(module, torch.nn.Sequential) else list(module)
+            if len(children) >= 4:  # Reasonable number of blocks
+                logger.info(f"[CacheDiT] ✓ Found {len(children)} blocks in .{name} (deep search)")
+                return children
+    
+    logger.warning(f"[CacheDiT] ⚠ Manual block extraction failed - no standard block attributes found")
+    return None
+
 
 def build_block_adapter(
     transformer: torch.nn.Module,
@@ -446,12 +518,12 @@ def build_block_adapter(
     auto_detect: bool = True,
 ):
     """
-    Build BlockAdapter for a transformer model.
+    Build BlockAdapter for a transformer model with manual block extraction fallback.
     
     Args:
         transformer: The diffusion model transformer
         forward_pattern: Pattern name (Pattern_0 to Pattern_5)
-        auto_detect: Auto-detect transformer blocks
+        auto_detect: Auto-detect transformer blocks (will fallback to manual if fails)
     """
     try:
         from cache_dit import BlockAdapter
@@ -462,24 +534,47 @@ def build_block_adapter(
         transformer_class = transformer.__class__.__module__ + "." + transformer.__class__.__name__
         logger.info(f"[CacheDiT] Building BlockAdapter for: {transformer_class}")
         
-        # For ComfyUI models (non-diffusers), pass transformer directly
-        # BlockAdapter will auto-detect blocks and handle non-diffusers structure
-        adapter = BlockAdapter(
-            transformer=transformer,
-            forward_pattern=pattern,
-            auto=auto_detect,
-        )
+        # CRITICAL FIX: For ComfyUI models, manually extract and inject blocks
+        # This ensures cache-dit can find them when enable_cache(transformer) is called
+        manual_blocks = _manual_extract_blocks(transformer)
+        
+        if manual_blocks and len(manual_blocks) > 0:
+            logger.info(f"[CacheDiT] ✓ Manual extraction successful: {len(manual_blocks)} blocks")
+            
+            # Store blocks in transformer for cache-dit to discover
+            # Use standard attribute names that cache-dit recognizes
+            if not hasattr(transformer, 'blocks'):
+                transformer.blocks = torch.nn.ModuleList(manual_blocks)
+                logger.info(f"[CacheDiT] Injected blocks into transformer.blocks")
+            
+            # Create adapter for validation only
+            adapter = BlockAdapter(
+                transformer=transformer,
+                forward_pattern=pattern,
+                auto=True,  # Now it can auto-detect from transformer.blocks
+            )
+        else:
+            # Fallback to auto-detection (for diffusers models)
+            logger.info(f"[CacheDiT] Manual extraction failed, attempting auto-detection...")
+            adapter = BlockAdapter(
+                transformer=transformer,
+                forward_pattern=pattern,
+                auto=auto_detect,
+            )
         
         # Verify adapter was created successfully
         if hasattr(adapter, 'blocks') and adapter.blocks:
-            logger.info(f"[CacheDiT] BlockAdapter created with {len(adapter.blocks)} blocks")
+            logger.info(f"[CacheDiT] ✓ BlockAdapter created successfully with {len(adapter.blocks)} blocks")
         else:
-            logger.warning(f"[CacheDiT] BlockAdapter created but blocks list may be empty")
+            logger.error(f"[CacheDiT] ✗ BlockAdapter created but blocks list is empty!")
+            raise RuntimeError("BlockAdapter has no blocks - caching will not work")
         
         return adapter
         
     except Exception as e:
         logger.error(f"[CacheDiT] Failed to build BlockAdapter: {e}")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"Failed to build BlockAdapter for {transformer.__class__.__name__}: {e}")
 
 
@@ -598,8 +693,20 @@ def format_summary_dashboard(
     lines.append("║" + f"  [{bar}]  ║")
     lines.append("║" + f"  1.0x".ljust(bar_width // 2) + f"3.0x".rjust(bar_width // 2 + 6) + "  ║")
     
-    # Footer
+    # Footer with troubleshooting tips
     lines.append("╠" + "═" * (width - 2) + "╣")
+    
+    # Add troubleshooting tips if cache hit rate is 0
+    if cache_hit_rate == 0 and total_steps > 0:
+        lines.append("║" + "⚠️  TROUBLESHOOTING: Cache Hit Rate is 0%".center(width - 2) + "║")
+        lines.append("╠" + "─" * (width - 2) + "╣")
+        lines.append("║" + "  Possible fixes:".ljust(width - 2) + "║")
+        lines.append("║" + f"  • Increase threshold (current: {config_info.get('threshold', 0):.4f})".ljust(width - 2) + "║")
+        lines.append("║" + "  • Try threshold 0.15-0.25 for more caching".ljust(width - 2) + "║")
+        lines.append("║" + f"  • Reduce Fn blocks (current: F{config_info.get('fn', 0)})".ljust(width - 2) + "║")
+        lines.append("║" + "  • Check if blocks were detected (see logs)".ljust(width - 2) + "║")
+        lines.append("╠" + "═" * (width - 2) + "╣")
+    
     tip = "💡 Lower threshold = better quality, less speedup"
     lines.append("║" + tip.center(width - 2) + "║")
     lines.append("╚" + "═" * (width - 2) + "╝")
