@@ -25,6 +25,8 @@ ComfyUI-CacheDiT brings **1.4-1.6x speedup** to DiT (Diffusion Transformer) mode
 | **Z-Image** | 50 | 1.3x | ✅ | 0.25 | 5 |
 | **Z-Image-Turbo** | 9 | 1.5x | ✅ | 0.35 | 2 |
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | ✅ | 0.3 | 4 |
+| **LTX-2 T2V** | 20 | 2.0x | ✅ | 0.3 | 4 |
+| **LTX-2 I2V** | 20 | 2.0x | ✅ | 0.3 | 4 |
 
 ## Installation
 
@@ -48,6 +50,8 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 
 ### Ultra-Simple Usage (3 Steps)
 
+**For Image Models (Z-Image, Qwen-Image):**
+
 1. Load your model
 2. Connect to **⚡ CacheDiT Accelerator** node
 3. Connect to KSampler - **Done!**
@@ -67,16 +71,6 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 
 **That's it!** All technical parameters (threshold, fn_blocks, warmup, etc.) are automatically configured based on your model type.
 
-## How Auto-Detection Works
-
-The node automatically detects your model architecture:
-
-- **QwenImageTransformer** → Qwen-Image preset
-- **NextDiT / Lumina** → Z-Image preset  
-
-No manual configuration needed!
-
-
 ## How It Works
 
 ### Intelligent Fallback System
@@ -93,6 +87,7 @@ For ComfyUI models (Qwen-Image, Z-Image, etc.), the lightweight cache automatica
 **Model-Specific Optimization**:
 - **Z-Image/Turbo**: Aggressive caching (warmup=3, skip_interval=2)
 - **Qwen-Image**: Balanced approach (warmup=3, skip_interval=2-3)
+- **LTX-2 (T2V/I2V)**: Conservative for temporal consistency (warmup=6, skip_interval=4)
 
 **Caching Logic**:
 ```python
@@ -119,6 +114,8 @@ else:
 - ✅ Z-Image (50 steps)
 - ✅ Z-Image-Turbo (9 steps)  
 - ✅ Qwen-Image-2512 (50 steps)
+- ✅ LTX-2 T2V (Text-to-Video, 20 steps)
+- ✅ LTX-2 I2V (Image-to-Video, 20 steps)
 
 Other DiT models should work with auto-detection, but may need manual preset selection.
 
@@ -138,7 +135,10 @@ Other DiT models should work with auto-detection, but may need manual preset sel
 
 **A:** Manually select your model from the `model_type` dropdown:
 - Z-Image
+- Z-Image-Turbo
 - Qwen-Image
+- LTX-2-T2V
+- LTX-2-I2V
 
 
 ### Q: Performance Dashboard shows 0% cache hit?
