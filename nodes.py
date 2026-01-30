@@ -29,9 +29,6 @@ from .utils import (
     get_forward_pattern,
     build_cache_config,
     build_calibrator_config,
-    build_block_adapter,
-    format_summary_dashboard,
-    get_summary_stats,
     print_summary_to_log,
     apply_noise_injection,
 )
@@ -95,22 +92,22 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     total_steps = config.num_inference_steps if config.num_inference_steps else 28
     
     # Check if user provided overrides
-    has_user_warmup = hasattr(config, 'user_warmup_ratio') and config.user_warmup_ratio > 0
+    has_user_warmup = hasattr(config, 'user_warmup_steps') and config.user_warmup_steps > 0
     has_user_skip = hasattr(config, 'user_skip_interval') and config.user_skip_interval > 0
     
     # Debug: log what we found
     logger.info(
         f"[CacheDiT] Checking user overrides: "
-        f"has_warmup_attr={hasattr(config, 'user_warmup_ratio')}, "
-        f"warmup_value={getattr(config, 'user_warmup_ratio', 'N/A')}, "
+        f"has_warmup_attr={hasattr(config, 'user_warmup_steps')}, "
+        f"warmup_value={getattr(config, 'user_warmup_steps', 'N/A')}, "
         f"has_skip_attr={hasattr(config, 'user_skip_interval')}, "
         f"skip_value={getattr(config, 'user_skip_interval', 'N/A')}"
     )
     
     if has_user_warmup:
-        # User specified warmup ratio
-        warmup_steps = int(total_steps * config.user_warmup_ratio)
-        logger.info(f"[CacheDiT] User override: warmup_ratio={config.user_warmup_ratio:.2f} → {warmup_steps} steps")
+        # User specified warmup steps directly
+        warmup_steps = config.user_warmup_steps
+        logger.info(f"[CacheDiT] User override: warmup_steps={warmup_steps}")
     else:
         # Will be set from model-specific defaults
         warmup_steps = None
@@ -392,7 +389,7 @@ class CacheDiTConfig:
         verbose: bool = False,
         print_summary: bool = True,
         # User overrides
-        user_warmup_ratio: float = 0.0,
+        user_warmup_steps: int = 0,
         user_skip_interval: int = 0,
     ):
         # Configuration
@@ -417,7 +414,7 @@ class CacheDiTConfig:
         self.print_summary = print_summary
         
         # User overrides for lightweight cache
-        self.user_warmup_ratio = user_warmup_ratio
+        self.user_warmup_steps = user_warmup_steps
         self.user_skip_interval = user_skip_interval
         
         # Runtime state
@@ -445,7 +442,7 @@ class CacheDiTConfig:
             verbose=self.verbose,
             print_summary=self.print_summary,
             # User overrides (FIX: these were missing!)
-            user_warmup_ratio=self.user_warmup_ratio,
+            user_warmup_steps=self.user_warmup_steps,
             user_skip_interval=self.user_skip_interval,
         )
         new_config.is_enabled = self.is_enabled
@@ -863,13 +860,13 @@ class CacheDiT_Model_Optimizer:
                     "tooltip": "Model preset (Auto=auto-detect, or select specific model)\n"
                                "模型预设 (Auto=自动检测, 或选择特定模型)"
                 }),
-                "warmup_ratio": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": "Warmup ratio (0.0=use preset default, 0.25=warmup 25% of steps)\n"
-                               "预热比例 (0.0=使用预设默认值, 0.25=预热25%步数)"
+                "warmup_steps": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Warmup steps (0=use preset default, 8=warmup 8 steps)\n"
+                               "预热步数 (0=使用预设默认值, 8=预热8步)"
                 }),
                 "skip_interval": ("INT", {
                     "default": 0,
@@ -900,7 +897,7 @@ class CacheDiT_Model_Optimizer:
         model,
         enable: bool = True,
         model_type: str = "Auto",
-        warmup_ratio: float = 0.0,
+        warmup_steps: int = 0,
         skip_interval: int = 0,
         print_summary: bool = True,
     ):
@@ -909,7 +906,7 @@ class CacheDiT_Model_Optimizer:
         # Debug: Log ALL received parameters
         logger.info(f"[CacheDiT] optimize() received parameters:")
         logger.info(f"  enable={enable}, model_type={model_type}")
-        logger.info(f"  warmup_ratio={warmup_ratio} (type: {type(warmup_ratio).__name__})")
+        logger.info(f"  warmup_steps={warmup_steps} (type: {type(warmup_steps).__name__})")
         logger.info(f"  skip_interval={skip_interval} (type: {type(skip_interval).__name__})")
         logger.info(f"  print_summary={print_summary}")
         
@@ -950,8 +947,8 @@ class CacheDiT_Model_Optimizer:
         preset = get_preset(model_type)
         
         # Log user overrides
-        if warmup_ratio > 0 or skip_interval > 0:
-            logger.info(f"[CacheDiT] User input: warmup_ratio={warmup_ratio}, skip_interval={skip_interval}")
+        if warmup_steps > 0 or skip_interval > 0:
+            logger.info(f"[CacheDiT] User input: warmup_steps={warmup_steps}, skip_interval={skip_interval}")
         
         # Use all preset defaults (fully automated)
         config = CacheDiTConfig(
@@ -971,7 +968,7 @@ class CacheDiT_Model_Optimizer:
             verbose=False,
             print_summary=print_summary,
             # User overrides for lightweight cache
-            user_warmup_ratio=warmup_ratio,
+            user_warmup_steps=warmup_steps,
             user_skip_interval=skip_interval,
         )
         
