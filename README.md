@@ -25,9 +25,11 @@ ComfyUI-CacheDiT brings **1.4-1.6x speedup** to DiT (Diffusion Transformer) mode
 |-------|-------|---------|--------|---------|--------|
 | **Z-Image** | 50 | 1.3x | ✅ | 12 | 5 |
 | **Z-Image-Turbo** | 9 | 1.5x | ✅ | 3 | 2 |
-| **Qwen-Image-2512** | 50 | 1.4-1.6x | ✅ | 15 | 4 |
+| **Qwen-Image-2512** | 50 | 1.4-1.6x | ✅ | 5 | 3 |
 | **LTX-2 T2V** | 20 | 2.0x | ✅ | 6 | 4 |
 | **LTX-2 I2V** | 20 | 2.0x | ✅ | 6 | 4 |
+| **WAN2.2 14B T2V** | 20 | 1.67x | ✅ | 4 | 2 |
+| **WAN2.2 14B I2V** | 20 | 1.67x | ✅ | 4 | 2 |
 
 ## Installation
 
@@ -60,6 +62,21 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 [Load Checkpoint] → [⚡ CacheDiT Accelerator] → [KSampler]
 ```
 
+**For Video Models (LTX-2, WAN2.2 14B):**
+
+**LTX-2 Models:**
+```
+[Load Checkpoint] → [⚡ LTX2 Cache Optimizer] → [Stage 1 KSampler]
+```
+
+**WAN2.2 14B Models (High-Noise + Low-Noise MoE):**
+```
+[High-Noise Model] → [⚡ Wan Cache Optimizer] → [KSampler]
+                                               
+[Low-Noise Model]  → [⚡ Wan Cache Optimizer] → [KSampler]
+```
+*Each expert model gets its own optimizer node with independent cache.*
+
 ### Node Parameters
 
 | Parameter | Type | Default | Description |
@@ -88,6 +105,11 @@ For ComfyUI models (Qwen-Image, Z-Image, etc.), the lightweight cache automatica
 - **Z-Image/Turbo**: Aggressive caching (warmup=3, skip_interval=2)
 - **Qwen-Image**: Balanced approach (warmup=3, skip_interval=2-3)
 - **LTX-2 (T2V/I2V)**: Conservative for temporal consistency (warmup=6, skip_interval=4)
+- **WAN2.2 14B (T2V/I2V)**: Optimized for MoE architecture (warmup=4, skip_interval=2)
+  - Uses dedicated `WanCacheOptimizer` node
+  - Supports High-Noise + Low-Noise expert models
+  - Per-transformer cache isolation (multi-instance safe)
+  - Memory-efficient: detach-only caching prevents VAE OOM
 
 **Caching Logic**:
 ```python
@@ -120,18 +142,14 @@ This project is based on [**cache-dit**](https://github.com/vipshop/cache-dit) b
 - ✅ Qwen-Image-2512 (50 steps)
 - ✅ LTX-2 T2V (Text-to-Video, 20 steps)
 - ✅ LTX-2 I2V (Image-to-Video, 20 steps)
+- ✅ WAN2.2 14B T2V (Text-to-Video, 20 steps)
+- ✅ WAN2.2 14B I2V (Image-to-Video, 20 steps)
+
+**Note for LTX-2**: This audio-visual transformer uses dual latent paths (video + audio). Use the dedicated `⚡ LTX2 Cache Optimizer` node (not the standard CacheDiT node) for optimal temporal consistency and quality.
+
+**Note for WAN2.2 14B**: This model uses a MoE (Mixture of Experts) architecture with High-Noise and Low-Noise models. Use the dedicated `⚡ Wan Cache Optimizer` node (not the standard CacheDiT node) for best results.
 
 Other DiT models should work with auto-detection, but may need manual preset selection.
-
-### Q: What if auto-detection fails?
-
-**A:** Manually select your model from the `model_type` dropdown:
-- Z-Image
-- Z-Image-Turbo
-- Qwen-Image
-- LTX-2-T2V
-- LTX-2-I2V
-
 
 ### Q: Performance Dashboard shows 0% cache hit?
 
