@@ -327,11 +327,6 @@ def build_cache_config(
                 config.steps_computation_mask = scm_mask
                 config.steps_computation_policy = "dynamic"
         
-        logger.info(
-            f"[CacheDiT] DBCacheConfig: strategy={strategy}, "
-            f"max_cached_steps={config.max_cached_steps}, threshold={threshold}"
-        )
-        
         return config
         
     except ImportError as e:
@@ -405,19 +400,15 @@ def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.
     blocks = []
     transformer_class = transformer.__class__.__name__.lower()
     
-    logger.info(f"[CacheDiT] Attempting manual block extraction from: {transformer.__class__.__module__}.{transformer.__class__.__name__}")
-    
     # Strategy 1: Z-Image / Lumina2 (NextDiT architecture)
     # These models store blocks in .layers attribute
     if hasattr(transformer, 'layers'):
         layers = transformer.layers
         if isinstance(layers, (list, torch.nn.ModuleList)):
             blocks = list(layers)
-            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .layers (NextDiT/Lumina2 style)")
             return blocks
         elif isinstance(layers, torch.nn.Sequential):
             blocks = list(layers.children())
-            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks in .layers Sequential")
             return blocks
     
     # Strategy 2: Flux (dual-block architecture)
@@ -432,7 +423,6 @@ def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.
             if isinstance(single_blocks, (list, torch.nn.ModuleList)):
                 blocks.extend(list(single_blocks))
         if blocks:
-            logger.info(f"[CacheDiT] ✓ Found {len(blocks)} blocks (Flux dual-block style)")
             return blocks
     
     # Strategy 3: LTX-2 / HunyuanVideo / Standard DiT
