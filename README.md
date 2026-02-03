@@ -130,7 +130,11 @@ else:
 
 ## Credits
 
-This project is based on [**cache-dit**](https://github.com/vipshop/cache-dit) by Vipshop's Machine Learning Platform Team.
+Based on [**cache-dit**](https://github.com/vipshop/cache-dit) by Vipshop's Machine Learning Platform Team.
+
+Built for [**ComfyUI**](https://github.com/comfyanonymous/ComfyUI) - the powerful and modular Stable Diffusion GUI.
+
+Inspired by [**Intel llm-scaler**](https://github.com/intel/llm-scaler), a high-performance LLM serving framework on Intel XPU.
 
 ## FAQ
 
