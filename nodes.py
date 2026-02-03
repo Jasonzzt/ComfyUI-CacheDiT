@@ -56,25 +56,14 @@ _lightweight_cache_state = {
 
 
 def _enable_lightweight_cache(transformer, blocks, config, cache_config):
-    """
-    Lightweight caching via direct forward hook (fallback for unsupported models)
-    
-    This approach directly replaces transformer.forward with a cached version,
-    bypassing cache-dit's complex BlockAdapter architecture.
-    
-    Based on the high-performance implementation from enhanced cache repo.
-    """
+    """Enable lightweight cache by replacing transformer.forward"""
     global _lightweight_cache_state
     
-    # Check if already patched
     if hasattr(transformer, '_original_forward'):
         logger.warning("[LightweightCache] Transformer already patched, skipping")
         return
     
-    # Save original forward
     transformer._original_forward = transformer.forward
-    
-    # Reset state
     _lightweight_cache_state = {
         "enabled": True,
         "transformer_id": id(transformer),
@@ -205,30 +194,11 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     if 'noise_scale' not in locals():
         noise_scale = 0.0
     
-    # Log final configuration
-    logger.info(
-        f"[CacheDiT] Lightweight cache config: "
-        f"warmup={warmup_steps}/{total_steps} ({100*warmup_steps//total_steps}%), "
-        f"skip_interval={skip_interval} (~{100//skip_interval}% cache), "
-        f"noise={noise_scale:.4f}"
-    )
-    
     def cached_forward(*args, **kwargs):
-        """
-        Cached forward with optimized skip logic
-        
-        Strategy: After warmup, skip every other step (call_count % 2 == 0)
-        This achieves ~1.5-2x speedup with minimal quality loss.
-        """
         state = _lightweight_cache_state
         state["call_count"] += 1
         call_id = state["call_count"]
         
-        # Debug logging for first 10 calls
-        if call_id <= 10:
-            logger.info(f"[LightweightCache] Call #{call_id}, warmup={warmup_steps}, skip_interval={skip_interval}")
-        
-        # Warmup phase: always compute (first N steps)
         if call_id <= warmup_steps:
             import time
             start = time.time()
@@ -238,47 +208,26 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             state["compute_count"] += 1
             state["compute_times"].append(elapsed)
             
-            # Cache result for next iteration - support both Tensor and tuple
-            # ALWAYS use .detach() only, no .clone() to save memory
             if isinstance(result, torch.Tensor):
                 state["last_result"] = result.detach()
             elif isinstance(result, tuple):
-                # Handle tuple of tensors (common in transformers)
                 state["last_result"] = tuple(
                     r.detach() if isinstance(r, torch.Tensor) else r
                     for r in result
                 )
             else:
-                # For other types, store as-is
                 state["last_result"] = result
-            
-            if call_id <= 10:
-                result_type = type(result).__name__
-                if isinstance(result, tuple):
-                    result_type = f"tuple[{len(result)}]"
-                logger.info(f"[LightweightCache]   → WARMUP: computed, cached={state['last_result'] is not None}, type={result_type}")
             
             return result
         
-        # Post-warmup: decide whether to skip based on fixed interval
-        # Skip pattern: For skip_interval=2: compute, skip, compute, skip, ...
-        # For skip_interval=8: compute 7 times, skip 1, compute 7 times, skip 1, ...
         steps_after_warmup = call_id - warmup_steps
-        should_skip = (steps_after_warmup % skip_interval == 0)  # Skip when divisible by interval
-        
-        if call_id <= 15:
-            logger.info(f"[LightweightCache]   → After warmup: step={steps_after_warmup}, should_skip={should_skip}, has_cache={state['last_result'] is not None}")
+        should_skip = (steps_after_warmup % skip_interval == 0)
         
         if should_skip and state["last_result"] is not None:
-            # Use cached result (with optional noise injection)
             state["skip_count"] += 1
-            
-            if call_id <= 15:
-                logger.info(f"[LightweightCache]   → USING CACHE (skip #{state['skip_count']})")
             
             cached_result = state["last_result"]
             
-            # Apply noise if configured
             if noise_scale > 0:
                 if isinstance(cached_result, torch.Tensor):
                     noise = torch.randn_like(cached_result) * noise_scale
@@ -292,10 +241,6 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             
             return cached_result
         else:
-            # Compute normally and update cache
-            if call_id <= 15:
-                logger.info(f"[LightweightCache]   → COMPUTING (compute #{state['compute_count'] + 1})")
-            
             import time
             start = time.time()
             result = transformer._original_forward(*args, **kwargs)
@@ -304,7 +249,6 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             state["compute_count"] += 1
             state["compute_times"].append(elapsed)
             
-            # Update cache for next skip - support both Tensor and tuple
             if isinstance(result, torch.Tensor):
                 state["last_result"] = result.detach()
             elif isinstance(result, tuple):
@@ -321,10 +265,9 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     transformer.forward = cached_forward
     
     logger.info(
-        f"[CacheDiT] ✓ Lightweight cache enabled: "
+        f"[CacheDiT] Lightweight cache enabled: "
         f"model={transformer_class}, steps={total_steps}, "
-        f"warmup={warmup_steps}, skip_interval={skip_interval}, "
-        f"noise_scale={noise_scale:.4f}"
+        f"warmup={warmup_steps}, skip_interval={skip_interval}"
     )
 
 
@@ -649,7 +592,7 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         if not manual_blocks or len(manual_blocks) == 0:
             raise RuntimeError("Failed to extract blocks from transformer")
         
-        logger.info(f"[CacheDiT] ✓ Extracted {len(manual_blocks)} blocks for caching")
+        logger.info(f"[CacheDiT] Extracted {len(manual_blocks)} blocks for caching")
         
         # Build cache config
         cache_config = build_cache_config(
@@ -671,49 +614,49 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         # Get forward pattern
         pattern = get_forward_pattern(config.forward_pattern)
         
-        # === Strategy Selection: cache-dit BlockAdapter (official) ===
-        # Official cache-dit supports Z-Image (NextDiT) via registered adapter
+        # === Check if lightweight cache should be used directly ===
         transformer_class_name = transformer.__class__.__name__
         
-        # Detect Z-Image/NextDiT: use Pattern_3 with check_forward_pattern=False
-        is_zimage = transformer_class_name == "NextDiT"
-        if is_zimage and ForwardPattern is not None:
-            pattern = ForwardPattern.Pattern_3
-            logger.info(f"[CacheDiT] Detected Z-Image (NextDiT) - using Pattern_3")
-        elif is_zimage:
-            logger.warning(f"[CacheDiT] ForwardPattern not available, using default pattern for Z-Image")
+        # ComfyUI models typically don't work well with cache-dit BlockAdapter
+        # Use lightweight cache directly for better compatibility
+        use_lightweight = transformer_class_name in [
+            "NextDiT",        # Z-Image
+            "Lumina",         # Lumina
+            "QwenImage",      # Qwen-Image
+            "HunyuanVideo",   # HunyuanVideo
+        ]
+        
+        if use_lightweight:
+            logger.info(f"[CacheDiT] Using lightweight cache for {transformer_class_name}")
+            _enable_lightweight_cache(
+                transformer=transformer,
+                blocks=manual_blocks,
+                config=config,
+                cache_config=cache_config,
+            )
+            return
         
         # === Attempt to use cache-dit's BlockAdapter ===
         cache_dit_failed = False
         try:
-            # For Z-Image: blocks are in .layers, use transformer-based creation
-            if is_zimage:
-                # Z-Image blocks are already in transformer.layers (ModuleList)
-                # Official Z-Image adapter: pass transformer directly, BlockAdapter will find .layers
-                adapter = BlockAdapter(
-                    transformer=transformer,
-                    forward_pattern=pattern,
-                    check_forward_pattern=False,  # Z-Image uses 'x' not 'hidden_states'
-                )
-            else:
-                # Standard models: ensure blocks are ModuleList
-                blocks_module_list = manual_blocks
-                if not isinstance(manual_blocks, torch.nn.ModuleList):
-                    blocks_module_list = torch.nn.ModuleList(manual_blocks)
-                    logger.info(f"[CacheDiT] Converted {len(manual_blocks)} blocks to ModuleList")
-                
-                # Inject blocks into transformer for cache-dit auto-detection
-                if not hasattr(transformer, 'blocks'):
-                    transformer.blocks = blocks_module_list
-                    logger.info(f"[CacheDiT] Injected blocks into transformer.blocks")
-                
-                adapter = BlockAdapter(blocks=blocks_module_list)
+            # Standard models: ensure blocks are ModuleList
+            blocks_module_list = manual_blocks
+            if not isinstance(manual_blocks, torch.nn.ModuleList):
+                blocks_module_list = torch.nn.ModuleList(manual_blocks)
+                logger.info(f"[CacheDiT] Converted {len(manual_blocks)} blocks to ModuleList")
+            
+            # Inject blocks into transformer for cache-dit auto-detection
+            if not hasattr(transformer, 'blocks'):
+                transformer.blocks = blocks_module_list
+                logger.info(f"[CacheDiT] Injected blocks into transformer.blocks")
+            
+            adapter = BlockAdapter(blocks=blocks_module_list)
             
             # Verify adapter has blocks
             if not hasattr(adapter, 'blocks') or len(adapter.blocks) == 0:
                 raise RuntimeError(f"BlockAdapter created but has no blocks!")
             
-            logger.info(f"[CacheDiT] ✓ BlockAdapter verified: {len(adapter.blocks)} blocks")
+            logger.info(f"[CacheDiT] BlockAdapter verified: {len(adapter.blocks)} blocks")
             
             # Enable cache with BlockAdapter
             enable_kwargs = {
@@ -732,7 +675,7 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
                 raise RuntimeError("BlockAdapter has no transformer reference")
             
             logger.info(
-                f"[CacheDiT] ✓ Cache enabled via BlockAdapter: "
+                f"[CacheDiT] Cache enabled via BlockAdapter: "
                 f"F{config.fn_blocks}B{config.bn_blocks}, "
                 f"threshold={config.threshold}, warmup={config.max_warmup_steps}"
             )
@@ -888,8 +831,8 @@ class CacheDiT_Model_Optimizer:
     FUNCTION = "optimize"
     CATEGORY = "⚡ CacheDiT"
     DESCRIPTION = (
-        "Accelerate DiT models (Qwen-Image, LTX-2, Z-Image, etc.) via residual caching.\n"
-        "通过残差缓存加速 DiT 模型 (Qwen-Image、LTX-2、Z-Image 等)"
+        "Accelerate DiT models (Qwen-Image, LTX-2, Z-Image, etc.) via caching.\n"
+        "通过缓存加速 DiT 模型 (Qwen-Image、LTX-2、Z-Image 等)"
     )
     
     def optimize(
@@ -902,13 +845,6 @@ class CacheDiT_Model_Optimizer:
         print_summary: bool = True,
     ):
         """Apply CacheDiT optimization to the model."""
-        
-        # Debug: Log ALL received parameters
-        logger.info(f"[CacheDiT] optimize() received parameters:")
-        logger.info(f"  enable={enable}, model_type={model_type}")
-        logger.info(f"  warmup_steps={warmup_steps} (type: {type(warmup_steps).__name__})")
-        logger.info(f"  skip_interval={skip_interval} (type: {type(skip_interval).__name__})")
-        logger.info(f"  print_summary={print_summary}")
         
         # If disabled, return model as-is
         if not enable:
@@ -946,10 +882,6 @@ class CacheDiT_Model_Optimizer:
         # Get preset
         preset = get_preset(model_type)
         
-        # Log user overrides
-        if warmup_steps > 0 or skip_interval > 0:
-            logger.info(f"[CacheDiT] User input: warmup_steps={warmup_steps}, skip_interval={skip_interval}")
-        
         # Use all preset defaults (fully automated)
         config = CacheDiTConfig(
             model_type=model_type,
@@ -985,11 +917,6 @@ class CacheDiT_Model_Optimizer:
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
             "cache_dit_turbo",
             _cache_dit_diffusion_model_wrapper
-        )
-        
-        logger.info(
-            f"[CacheDiT] ✓ Enabled: {model_type} preset, "
-            f"F{preset.fn_blocks}B{preset.bn_blocks}, threshold={preset.threshold}"
         )
         
         return (model,)

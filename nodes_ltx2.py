@@ -78,36 +78,8 @@ class LTX2CacheConfig:
 
 
 def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
-    """
-    Enable lightweight cache specifically for LTX-2 transformer.
-    
-    Conservative settings for video generation quality:
-    - Default: warmup=10, skip=5 (40% cache for 20 steps, 1.7x speedup)
-    - Longer warmup ensures stable feature representation
-    - Larger skip interval reduces aggressive caching for better quality
-    - Small noise injection maintains temporal consistency
-    
-    Cache Strategy:
-    - Warmup phase: Always compute first N steps
-    - Post-warmup: Compute at step 1, then every skip_interval steps
-    
-    Math Formula: computed = warmup + ⌈(total - warmup) / skip⌉
-    
-    Example for 20 steps (warmup=10, skip=5):
-    - Compute: steps 1-10 (warmup) + 11, 16 = 12 steps
-    - Cache: steps 12-15, 17-20 = 8 steps
-    - Cache hit rate: 40%
-    
-    Example for 20 steps (warmup=6, skip=4):
-    - Compute: steps 1-6 (warmup) + 7, 11, 15, 19 = 10 steps
-    - Cache: steps 8-10, 12-14, 16-18, 20 = 10 steps
-    - Cache hit rate: 50%
-    
-    For longer sequences (40+ steps), cache rate will be higher.
-    """
+    """Enable lightweight cache for LTX-2 transformer (timestep-based tracking)"""
     global _ltx2_cache_state
-    
-    # Check if already patched
     if hasattr(transformer, '_original_forward'):
         current_id = id(transformer)
         cached_id = _ltx2_cache_state.get("transformer_id")
@@ -123,10 +95,8 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             })
             return
     
-    # Save original forward
     transformer._original_forward = transformer.forward
     
-    # Initialize state (match main node's lightweight cache pattern)
     _ltx2_cache_state.update({
         "enabled": True,
         "transformer_id": id(transformer),
@@ -452,7 +422,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
     transformer.forward = cached_forward
     
     logger.info(
-        f"[LTX2-Cache] ✓ Enabled: warmup={config.warmup_steps}, "
+        f"[LTX2-Cache] Enabled: warmup={config.warmup_steps}, "
         f"skip_interval={config.skip_interval}, noise_scale={config.noise_scale:.4f}"
     )
 
