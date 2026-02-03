@@ -134,17 +134,6 @@ This project is based on [**cache-dit**](https://github.com/vipshop/cache-dit) b
 
 ## FAQ
 
-### Q: Does this work with all models?
-
-**A:** Tested and verified for:
-- ✅ Z-Image (50 steps)
-- ✅ Z-Image-Turbo (9 steps)  
-- ✅ Qwen-Image-2512 (50 steps)
-- ✅ LTX-2 T2V (Text-to-Video, 20 steps)
-- ✅ LTX-2 I2V (Image-to-Video, 20 steps)
-- ✅ WAN2.2 14B T2V (Text-to-Video, 20 steps)
-- ✅ WAN2.2 14B I2V (Image-to-Video, 20 steps)
-
 **Note for LTX-2**: This audio-visual transformer uses dual latent paths (video + audio). Use the dedicated `⚡ LTX2 Cache Optimizer` node (not the standard CacheDiT node) for optimal temporal consistency and quality.
 
 **Note for WAN2.2 14B**: This model uses a MoE (Mixture of Experts) architecture with High-Noise and Low-Noise models. Use the dedicated `⚡ Wan Cache Optimizer` node (not the standard CacheDiT node) for best results.
