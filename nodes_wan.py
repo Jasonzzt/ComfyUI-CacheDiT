@@ -90,27 +90,9 @@ class WanCacheConfig:
 
 
 def _enable_wan_cache(transformer, config: WanCacheConfig):
-    """
-    Enable lightweight cache for Wan2.2 transformer.
-    
-    Cache Strategy:
-    - Warmup phase: Always compute first warmup_steps steps
-    - Post-warmup: Compute only when (current_step - warmup_steps) % skip_interval == 0
-    - Other steps: Return cached result directly
-    
-    Memory Optimization:
-    - Use .detach() ONLY (no .clone()) to save VRAM
-    - Critical for preventing VAE stage OOM
-    
-    Example (warmup=4, skip=2, total=20):
-    - Compute: steps 1-4 (warmup) + 5, 7, 9, 11, 13, 15, 17, 19 = 12 steps
-    - Cache: steps 6, 8, 10, 12, 14, 16, 18, 20 = 8 steps
-    - Cache rate: 40%, speedup: ~1.7x
-    """
+    """Enable lightweight cache for Wan2.2 transformer"""
     transformer_id = id(transformer)
     state = _get_or_create_cache_state(transformer_id)
-    
-    # Check if already patched
     if hasattr(transformer, '_original_forward_wan'):
         if state.get("transformer_id") == transformer_id:
             logger.info("[Wan-Cache] Already enabled, resetting state")
@@ -139,16 +121,9 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
     })
     
     def cached_forward(*args, **kwargs):
-        """
-        Cached forward for Wan2.2 transformer.
-        
-        Implements lightweight cache with warmup + skip logic.
-        """
         state = _get_or_create_cache_state(transformer_id)
         state["call_count"] += 1
         call_id = state["call_count"]
-        
-        # Get parameters from config
         cache_config = state.get("config")
         warmup_steps = cache_config.warmup_steps if cache_config else 4
         skip_interval = cache_config.skip_interval if cache_config else 2
@@ -239,7 +214,7 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
     transformer.forward = cached_forward
     
     logger.info(
-        f"[Wan-Cache] ✓ Enabled for transformer {transformer_id}: "
+        f"[Wan-Cache] Enabled for transformer {transformer_id}: "
         f"warmup={config.warmup_steps}, skip_interval={config.skip_interval}"
     )
 

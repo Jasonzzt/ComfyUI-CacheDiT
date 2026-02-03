@@ -17,7 +17,7 @@
 
 ## Overview
 
-ComfyUI-CacheDiT brings **1.4-1.6x speedup** to DiT (Diffusion Transformer) models through intelligent residual caching, with **zero configuration required**.
+ComfyUI-CacheDiT brings **1.4-1.6x speedup** to DiT (Diffusion Transformer) models through intelligent caching, with **zero configuration required**.
 
 
 ### Tested & Verified Models
@@ -139,20 +139,13 @@ else:
 
 ## Credits
 
-This project is based on [**cache-dit**](https://github.com/vipshop/cache-dit) by Vipshop's Machine Learning Platform Team.
+Based on [**cache-dit**](https://github.com/vipshop/cache-dit) by Vipshop's Machine Learning Platform Team.
+
+Built for [**ComfyUI**](https://github.com/comfyanonymous/ComfyUI) - the powerful and modular Stable Diffusion GUI.
+
+Inspired by [**Intel llm-scaler**](https://github.com/intel/llm-scaler), a high-performance LLM serving framework on Intel XPU.
 
 ## FAQ
-
-### Q: Does this work with all models?
-
-**A:** Tested and verified for:
-- ✅ Z-Image (50 steps)
-- ✅ Z-Image-Turbo (9 steps)  
-- ✅ Qwen-Image-2512 (50 steps)
-- ✅ LTX-2 T2V (Text-to-Video, 20 steps)
-- ✅ LTX-2 I2V (Image-to-Video, 20 steps)
-- ✅ WAN2.2 14B T2V (Text-to-Video, 20 steps)
-- ✅ WAN2.2 14B I2V (Image-to-Video, 20 steps)
 
 **Note for LTX-2**: This audio-visual transformer uses dual latent paths (video + audio). Use the dedicated `⚡ LTX2 Cache Optimizer` node (not the standard CacheDiT node) for optimal temporal consistency and quality.
 
