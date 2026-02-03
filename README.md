@@ -22,7 +22,7 @@ ComfyUI-CacheDiT brings **1.4-1.6x speedup** to DiT (Diffusion Transformer) mode
 ### Tested & Verified Models
 
 | Model | Steps | Speedup | Warmup | Skip_interval |
-|-------|-------|---------|--------|---------|--------|
+|-------|-------|---------|---------|--------|
 | **Z-Image** | 50 | 1.3x | 12 | 5 |
 | **Z-Image-Turbo** | 9 | 1.5x | 3 | 2 |
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | 5 | 3 |
