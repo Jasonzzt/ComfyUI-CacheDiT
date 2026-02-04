@@ -13,12 +13,12 @@
 
 | w/o Cache-DiT Acceleration | w/ Cache-DiT Acceleration |
 |:---:|:---:|
-|<img src="./assets/without_cachedit.png" width=180px>| <img src="./assets/with_cachedit.png" width=180px>
+|<img src="./assets/without_cachedit.png" width=200px>| <img src="./assets/with_cachedit.png" width=200px>
 
 **Guidance Video (Click below)**
 
 <a href="https://www.youtube.com/watch?v=nbhxqRu21js">
-  <img src="https://img.youtube.com/vi/nbhxqRu21js/maxresdefault.jpg" alt="ComfyUI-CacheDiT Tutorial" width="400">
+  <img src="https://img.youtube.com/vi/nbhxqRu21js/maxresdefault.jpg" alt="ComfyUI-CacheDiT Tutorial" width="420">
 </a>
 
 *Thanks to Benji for the excellent tutorial!*
