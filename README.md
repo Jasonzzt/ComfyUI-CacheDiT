@@ -158,7 +158,7 @@ For extremely low step counts (< 6 steps), the warmup overhead significantly red
 
 ### Q: How can I disable the node without restarting ComfyUI?
 
-**A:** Simply set enable=False in the node and run it once. This will cleanly remove the CacheDiT optimization from your model without requiring a restart.
+**A:** Simply set `enable=False` in the node and run it once. This will cleanly remove the CacheDiT optimization from your model without requiring a restart.
 
 ### Q: Performance Dashboard shows 0% cache hit?
 
