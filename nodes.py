@@ -125,7 +125,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
         if warmup_steps is None:
             warmup_steps = min(3, total_steps // 3)
         if skip_interval is None:
-            skip_interval = 2  # 33% skip
+            skip_interval = 2
         noise_scale = 0.0
     
     elif "QwenImage" in transformer_class or "Qwen" in transformer_class:
@@ -134,9 +134,9 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             warmup_steps = min(3, total_steps // 10)  # Shorter warmup for speed
         if skip_interval is None:
             if total_steps <= 20:
-                skip_interval = 2  # 33% skip
+                skip_interval = 2
             elif total_steps <= 40:
-                skip_interval = 2  # 33% skip  
+                skip_interval = 2
             else:
                 skip_interval = 3  # 25% skip for very long sequences
         noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
@@ -146,7 +146,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
         if warmup_steps is None:
             warmup_steps = min(3, total_steps // 4)
         if skip_interval is None:
-            skip_interval = 2  # Standard 33% skip
+            skip_interval = 2
         noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
     
     elif "LTX" in transformer_class:
@@ -784,7 +784,7 @@ class CacheDiT_Model_Optimizer:
     Accelerates DiT model inference through inter-step residual caching.
     Automatically detects inference steps and refreshes context.
     
-    Supports: Qwen-Image, LTX-2, Z-Image, Flux, HunyuanVideo, Wan, and custom models.
+    Supports: Qwen-Image, Z-Image, Flux, HunyuanVideo, Wan, and custom models.
     """
     
     @classmethod
@@ -831,8 +831,8 @@ class CacheDiT_Model_Optimizer:
     FUNCTION = "optimize"
     CATEGORY = "⚡ CacheDiT"
     DESCRIPTION = (
-        "Accelerate DiT models (Qwen-Image, LTX-2, Z-Image, etc.) via caching.\n"
-        "通过缓存加速 DiT 模型 (Qwen-Image、LTX-2、Z-Image 等)"
+        "Accelerate DiT models (Qwen-Image, Z-Image, etc.) via caching.\n"
+        "通过缓存加速 DiT 模型 (Qwen-Image、Z-Image 等)"
     )
     
     def optimize(
@@ -868,10 +868,6 @@ class CacheDiT_Model_Optimizer:
                     model_type = "Z-Image"
                 elif "Flux" in class_name or "FLUX" in class_name:
                     model_type = "Flux"
-                elif "LTX" in class_name:
-                    model_type = "LTX-2"
-                elif "HunyuanVideo" in class_name:
-                    model_type = "HunyuanVideo"
                 else:
                     model_type = "Custom"
                     logger.info(f"[CacheDiT] ℹ️ Auto-detected unknown model: {class_name}, using Custom preset")
@@ -882,7 +878,7 @@ class CacheDiT_Model_Optimizer:
         # Get preset
         preset = get_preset(model_type)
         
-        # Use all preset defaults (fully automated)
+        # Use all preset defaults
         config = CacheDiTConfig(
             model_type=model_type,
             forward_pattern=preset.forward_pattern,
@@ -890,10 +886,10 @@ class CacheDiT_Model_Optimizer:
             fn_blocks=preset.fn_blocks,
             bn_blocks=preset.bn_blocks,
             threshold=preset.threshold,
-            max_warmup_steps=3,  # Optimized default (will be overridden by lightweight cache)
+            max_warmup_steps=3,
             enable_separate_cfg=preset.enable_separate_cfg,
             cfg_compute_first=preset.cfg_compute_first,
-            skip_interval=0,  # Auto-managed by lightweight cache
+            skip_interval=0,
             noise_scale=preset.noise_scale,
             taylor_order=1,
             scm_policy="none",
@@ -965,49 +961,6 @@ class CacheDiT_Disable:
             pass
         
         return (model,)
-
-
-class CacheDiT_Preset_Info:
-    """Display information about a model preset."""
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model_type": (get_all_preset_names(), {"default": "Qwen-Image"}),
-            }
-        }
-    
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("preset_info",)
-    FUNCTION = "get_info"
-    CATEGORY = "⚡ CacheDiT"
-    DESCRIPTION = "Get recommended settings for a model preset\n获取模型预设的推荐配置"
-    
-    def get_info(self, model_type: str):
-        preset = get_preset(model_type)
-        
-        info_lines = [
-            f"═══════════════════════════════════════════",
-            f"  Model Preset: {preset.name}",
-            f"═══════════════════════════════════════════",
-            f"  {preset.description}",
-            f"  {preset.description_cn}",
-            f"───────────────────────────────────────────",
-            f"  Forward Pattern:     {preset.forward_pattern}",
-            f"  Fn/Bn Blocks:        F{preset.fn_blocks}B{preset.bn_blocks}",
-            f"  Threshold:           {preset.threshold}",
-            f"  Warmup Steps:        {preset.max_warmup_steps}",
-            f"  Strategy:            {preset.default_strategy}",
-            f"───────────────────────────────────────────",
-            f"  Separate CFG:        {preset.enable_separate_cfg}",
-            f"  Skip Interval:       {preset.skip_interval}",
-            f"  Noise Scale:         {preset.noise_scale}",
-            f"  TaylorSeer Order:    {preset.taylor_order}",
-            f"═══════════════════════════════════════════",
-        ]
-        
-        return ("\n".join(info_lines),)
 
 
 # =============================================================================

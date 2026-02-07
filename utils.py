@@ -148,38 +148,38 @@ MODEL_PRESETS: Dict[str, ModelPreset] = {
     #   - T2V: Text-to-Video (diffusers.LTX2Pipeline)
     #   - I2V: Image-to-Video (diffusers.LTX2ImageToVideoPipeline)
     #   - Official serving uses CACHE_DIT_LTX2_PIPELINE env var to switch pipelines
-    "LTX-2-T2V": ModelPreset(
-        name="LTX-2-T2V",
-        description="LTX-2 Text-to-Video (temporal consistency)",
-        description_cn="LTX-2 文生视频 (时序一致性优化)",
-        forward_pattern="Pattern_1",
-        fn_blocks=4,  # F4B4 for video
-        bn_blocks=4,
-        threshold=0.08,
-        max_warmup_steps=6,
-        enable_separate_cfg=False,
-        cfg_compute_first=False,
-        skip_interval=3,  # Force compute every 3 steps for temporal consistency
-        noise_scale=0.001,
-        default_strategy="dynamic",
-        taylor_order=1,
-    ),
-    "LTX-2-I2V": ModelPreset(
-        name="LTX-2-I2V",
-        description="LTX-2 Image-to-Video",
-        description_cn="LTX-2 图生视频",
-        forward_pattern="Pattern_1",
-        fn_blocks=4,
-        bn_blocks=4,
-        threshold=0.08,
-        max_warmup_steps=6,
-        enable_separate_cfg=False,
-        cfg_compute_first=False,
-        skip_interval=3,
-        noise_scale=0.001,
-        default_strategy="dynamic",
-        taylor_order=1,
-    ),
+    # "LTX-2-T2V": ModelPreset(
+    #     name="LTX-2-T2V",
+    #     description="LTX-2 Text-to-Video (temporal consistency)",
+    #     description_cn="LTX-2 文生视频 (时序一致性优化)",
+    #     forward_pattern="Pattern_1",
+    #     fn_blocks=4,  # F4B4 for video
+    #     bn_blocks=4,
+    #     threshold=0.08,
+    #     max_warmup_steps=6,
+    #     enable_separate_cfg=False,
+    #     cfg_compute_first=False,
+    #     skip_interval=3,  # Force compute every 3 steps for temporal consistency
+    #     noise_scale=0.001,
+    #     default_strategy="dynamic",
+    #     taylor_order=1,
+    # ),
+    # "LTX-2-I2V": ModelPreset(
+    #     name="LTX-2-I2V",
+    #     description="LTX-2 Image-to-Video",
+    #     description_cn="LTX-2 图生视频",
+    #     forward_pattern="Pattern_1",
+    #     fn_blocks=4,
+    #     bn_blocks=4,
+    #     threshold=0.08,
+    #     max_warmup_steps=6,
+    #     enable_separate_cfg=False,
+    #     cfg_compute_first=False,
+    #     skip_interval=3,
+    #     noise_scale=0.001,
+    #     default_strategy="dynamic",
+    #     taylor_order=1,
+    # ),
     
     # =========================================================================
     # Custom / Fallback
@@ -747,5 +747,14 @@ def apply_noise_injection(
     if noise_scale <= 0:
         return output
     
-    noise = torch.randn_like(output, generator=generator) * noise_scale
+    # Handle generator compatibility (added in PyTorch 1.11.0)
+    if generator is not None:
+        try:
+            noise = torch.randn_like(output, generator=generator) * noise_scale
+        except TypeError:
+            # Fallback for older PyTorch versions
+            noise = torch.randn_like(output) * noise_scale
+    else:
+        noise = torch.randn_like(output) * noise_scale
+    
     return output + noise
