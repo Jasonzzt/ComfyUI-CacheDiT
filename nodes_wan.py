@@ -406,6 +406,10 @@ class WanCacheOptimizer:
         return {
             "required": {
                 "model": ("MODEL",),
+                "enable": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable/Disable Wan cache acceleration\n启用/禁用 Wan 缓存加速"
+                }),
                 "warmup_steps": ("INT", {
                     "default": 4,
                     "min": 1,
@@ -438,31 +442,53 @@ class WanCacheOptimizer:
     CATEGORY = "⚡ CacheDiT"
     DESCRIPTION = (
         "Wan2.2 专用缓存加速器 / Wan2.2 Cache Accelerator\n\n"
-        "✨ Features:\n"
-        "• Lightweight cache (warmup + skip interval)\n"
-        "• Multi-instance support (High-Noise + Low-Noise)\n"
-        "• Memory-efficient (detach-only, prevents VAE OOM)\n"
-        "• Auto-reset per sampling (clean slate each generation)\n\n"
-        "📊 Performance (warmup=4, skip=2, 20 steps):\n"
-        "• Compute: 12 steps (4 warmup + 8 selective)\n"
-        "• Cache: 8 steps (40% cache rate)\n"
-        "• Speedup: ~1.7x\n\n"
-        "🔧 Recommended Settings:\n"
-        "• Speed: warmup=3, skip=2 (50% cache, ~2.0x)\n"
-        "• Balanced ⭐: warmup=4, skip=2 (40% cache, ~1.7x)\n"
-        "• Quality: warmup=6, skip=3 (30% cache, ~1.4x)"
     )
     
     def optimize(
         self,
         model,
+        enable: bool = True,
         warmup_steps: int = 4,
         skip_interval: int = 2,
         print_summary: bool = True,
     ):
         """Apply Wan2.2 specific cache optimization."""
         
-        # Clone model (standard ComfyUI pattern)
+        # If disabled, return disabled model
+        if not enable:
+            logger.info("[Wan-Cache] Optimization disabled, model restored")
+            return self.disable(model)
+
+        # Check configuration from transformer (persistent across model clones)
+        transformer = None
+        existing_config = None
+        
+        if hasattr(model.model, 'diffusion_model'):
+            transformer = model.model.diffusion_model
+            existing_config = getattr(transformer, '_wan_cache_config', None)
+        
+        if existing_config is not None:
+            # Compare parameters
+            params_changed = (
+                existing_config["warmup_steps"] != warmup_steps or
+                existing_config["skip_interval"] != skip_interval or
+                existing_config["print_summary"] != print_summary
+            )
+            
+            if params_changed:
+                logger.info(
+                    f"[Wan-Cache] Parameters changed: "
+                    f"warmup {existing_config['warmup_steps']}→{warmup_steps}, "
+                    f"skip {existing_config['skip_interval']}→{skip_interval}"
+                )
+                # Disable and reconfigure
+                result = self.disable(model)
+                model = result[0]
+            else:
+                logger.info("[Wan-Cache] Configuration unchanged")
+                return (model,)
+        
+        # Clone model for new configuration
         model = model.clone()
         
         # Create config
@@ -473,14 +499,21 @@ class WanCacheOptimizer:
             print_summary=print_summary,
         )
         
-        # Store config in transformer_options
+        # Store config in both transformer_options and transformer object
         if "transformer_options" not in model.model_options:
             model.model_options["transformer_options"] = {}
         
         model.model_options["transformer_options"]["wan_cache"] = config
         
+        # Store simplified config on transformer for persistence
+        if transformer is not None:
+            transformer._wan_cache_config = {
+                "warmup_steps": warmup_steps,
+                "skip_interval": skip_interval,
+                "print_summary": print_summary,
+            }
+        
         # Register wrapper using ComfyUI's patcher_extension system
-        # This ensures cache state is reset at the start of each sampling task
         try:
             model.add_wrapper_with_key(
                 comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
@@ -489,12 +522,51 @@ class WanCacheOptimizer:
             )
             
             logger.info(
-                f"[Wan-Cache] ✓ Node configured: warmup={warmup_steps}, skip={skip_interval}"
+                f"[Wan-Cache] Configured: warmup={warmup_steps}, skip={skip_interval}"
             )
         
         except Exception as e:
             logger.error(f"[Wan-Cache] Failed to register wrapper: {e}")
             traceback.print_exc()
+        
+        return (model,)
+    
+    def disable(self, model):
+        """Disable Wan cache optimization."""
+        model = model.clone()
+        
+        # Remove config
+        if "wan_cache" in model.model_options.get("transformer_options", {}):
+            del model.model_options["transformer_options"]["wan_cache"]
+        
+        # Remove wrapper
+        if "wan_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
+            del model.wrappers[comfy.patcher_extension.WrappersMP.OUTER_SAMPLE]["wan_cache"]
+        
+        # Restore original forward and clear cache state
+        try:
+            if hasattr(model.model, 'diffusion_model'):
+                transformer = model.model.diffusion_model
+                
+                # Restore original forward
+                if hasattr(transformer, '_original_forward_wan'):
+                    transformer.forward = transformer._original_forward_wan
+                    delattr(transformer, '_original_forward_wan')
+                    logger.info("[Wan-Cache] Restored original forward")
+                
+                # Clear config marker
+                if hasattr(transformer, '_wan_cache_config'):
+                    delattr(transformer, '_wan_cache_config')
+                
+                # Clear cache registry
+                transformer_id = id(transformer)
+                global _wan_cache_registry
+                if transformer_id in _wan_cache_registry:
+                    del _wan_cache_registry[transformer_id]
+                    logger.info("[Wan-Cache] Cache state cleared")
+        
+        except Exception as e:
+            logger.warning(f"[Wan-Cache] Failed to fully restore: {e}")
         
         return (model,)
 
@@ -508,5 +580,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WanCacheOptimizer": "⚡ Wan Cache Optimizer",
+    "WanCacheOptimizer": "⚡ CacheDiT Wan Optimizer",
 }

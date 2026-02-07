@@ -149,28 +149,6 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             skip_interval = 2
         noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
     
-    elif "LTX" in transformer_class:
-        # LTX-2: Video generation model, needs temporal consistency
-        # Conservative settings to maintain frame quality and temporal coherence
-        if warmup_steps is None:
-            warmup_steps = max(6, total_steps // 3)  # Longer warmup for stable baseline
-        if skip_interval is None:
-            if total_steps <= 15:
-                skip_interval = 6  # Very short sequences - very conservative (16% cache)
-            elif total_steps <= 30:
-                skip_interval = 5  # Short sequences - conservative (20% cache)
-            else:
-                skip_interval = 4  # Long sequences - balanced (25% cache)
-        noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
-    
-    elif "HunyuanVideo" in transformer_class:
-        # HunyuanVideo: Complex video model, very conservative
-        if warmup_steps is None:
-            warmup_steps = max(8, total_steps // 4)
-        if skip_interval is None:
-            skip_interval = 5  # Very conservative for temporal consistency
-        noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
-    
     else:
         # Unknown models: use safe defaults
         if warmup_steps is None:
@@ -845,14 +823,68 @@ class CacheDiT_Model_Optimizer:
         print_summary: bool = True,
     ):
         """Apply CacheDiT optimization to the model."""
-        
         # If disabled, return model as-is
         if not enable:
-            logger.info("[CacheDiT] ⏸️ Optimization disabled")
-            return (model,)
+            logger.info("[CacheDiT] Optimization disabled, model restored")
+            return self.disable(model)
         
-        # Clone model to avoid modifying original
-        model = model.clone()
+        # Check configuration from transformer (more persistent than model_options)
+        transformer = None
+        existing_config = None
+        
+        if hasattr(model.model, 'diffusion_model'):
+            transformer = model.model.diffusion_model
+            existing_config = getattr(transformer, '_cache_dit_config', None)
+            logger.info(f"[CacheDiT] Transformer ID: {id(transformer)}, existing config: {existing_config is not None}")
+        else:
+            logger.info(f"[CacheDiT] No transformer found")
+        
+        if existing_config is not None:
+            # Need to resolve "Auto" before comparison
+            resolved_model_type = model_type
+            logger.info(f"[CacheDiT] Existing configuration detected: model_type={existing_config['model_type']}, "
+                  f"warmup_steps={existing_config['warmup_steps']}, "
+                  f"skip_interval={existing_config['skip_interval']}, "
+                  f"print_summary={existing_config['print_summary']}")
+            if model_type == "Auto":
+                if hasattr(model.model, 'diffusion_model'):
+                    transformer = model.model.diffusion_model
+                    class_name = transformer.__class__.__name__
+                    if "Qwen" in class_name:
+                        resolved_model_type = "Qwen-Image"
+                    elif "NextDiT" in class_name or "Lumina" in class_name:
+                        resolved_model_type = "Z-Image"
+                    elif "Flux" in class_name or "FLUX" in class_name:
+                        resolved_model_type = "Flux"
+                    else:
+                        resolved_model_type = "Custom"
+                else:
+                    resolved_model_type = "Custom"
+            
+            # Compare key parameters
+            params_changed = (
+                existing_config["model_type"] != resolved_model_type or
+                existing_config["warmup_steps"] != warmup_steps or
+                existing_config["skip_interval"] != skip_interval or
+                existing_config["print_summary"] != print_summary
+            )
+            
+            if params_changed:
+                logger.info(
+                    f"[CacheDiT] Parameters changed, reconfiguring... "
+                    f"(model: {existing_config['model_type']}→{resolved_model_type}, "
+                    f"warmup: {existing_config['warmup_steps']}→{warmup_steps}, "
+                    f"skip: {existing_config['skip_interval']}→{skip_interval})"
+                )
+                # Disable old configuration first (disable already clones internally)
+                result = self.disable(model)
+                model = result[0]
+            else:
+                logger.info("[CacheDiT] Configuration unchanged, keeping existing setup")
+                return (model,)
+        else:
+            # First-time configuration: need to clone
+            model = model.clone()
         
         # Auto-detect model type if "Auto" is selected
         if model_type == "Auto":
@@ -870,10 +902,10 @@ class CacheDiT_Model_Optimizer:
                     model_type = "Flux"
                 else:
                     model_type = "Custom"
-                    logger.info(f"[CacheDiT] ℹ️ Auto-detected unknown model: {class_name}, using Custom preset")
+                    logger.info(f"[CacheDiT] Auto-detected unknown model: {class_name}, using Custom preset")
             else:
                 model_type = "Custom"
-                logger.info("[CacheDiT] ℹ️ Cannot auto-detect model type, using Custom preset")
+                logger.info("[CacheDiT] Cannot auto-detect model type, using Custom preset")
         
         # Get preset
         preset = get_preset(model_type)
@@ -900,8 +932,23 @@ class CacheDiT_Model_Optimizer:
             user_skip_interval=skip_interval,
         )
         
-        # Store config in model options
+        # Store config in both model options and transformer (for persistence)
+        if "transformer_options" not in model.model_options:
+            model.model_options["transformer_options"] = {}
         model.model_options["transformer_options"]["cache_dit_turbo"] = config
+        
+        # Also store simplified config dict on transformer for persistence
+        if hasattr(model.model, 'diffusion_model'):
+            transformer = model.model.diffusion_model
+            transformer._cache_dit_config = {
+                "model_type": config.model_type,
+                "warmup_steps": config.user_warmup_steps,
+                "skip_interval": config.user_skip_interval,
+                "print_summary": config.print_summary,
+            }
+            logger.info(f"[CacheDiT] Config stored on transformer: {config.model_type}, warmup={config.user_warmup_steps}, skip={config.user_skip_interval}")
+        else:
+            logger.info(f"[CacheDiT] Config stored: {config.model_type}, warmup={config.user_warmup_steps}, skip={config.user_skip_interval}")
         
         # Add wrappers
         model.add_wrapper_with_key(
@@ -917,28 +964,6 @@ class CacheDiT_Model_Optimizer:
         
         return (model,)
 
-
-# =============================================================================
-# Additional Nodes
-# =============================================================================
-
-class CacheDiT_Disable:
-    """Disable CacheDiT acceleration on a model."""
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-            }
-        }
-    
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "disable"
-    CATEGORY = "⚡ CacheDiT"
-    DESCRIPTION = "Remove CacheDiT optimization from model\n移除模型的 CacheDiT 优化"
-    
     def disable(self, model):
         model = model.clone()
         
@@ -952,16 +977,39 @@ class CacheDiT_Disable:
             if "cache_dit_turbo" in model.wrappers.get(wrapper_type, {}):
                 del model.wrappers[wrapper_type]["cache_dit_turbo"]
         
-        # Disable cache-dit on transformer
+        # Restore original transformer state
         try:
-            import cache_dit
             if hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
-                cache_dit.disable_cache(model.model.diffusion_model)
-        except:
-            pass
+                transformer = model.model.diffusion_model
+                
+                # Restore lightweight cache forward method
+                if hasattr(transformer, '_original_forward'):
+                    transformer.forward = transformer._original_forward
+                    delattr(transformer, '_original_forward')
+                
+                # Disable standard cache-dit
+                try:
+                    import cache_dit
+                    cache_dit.disable_cache(transformer)
+                except:
+                    pass
+                
+                # Reset lightweight cache state
+                global _lightweight_cache_state
+                if _lightweight_cache_state.get("transformer_id") == id(transformer):
+                    _lightweight_cache_state = {
+                        "enabled": False,
+                        "transformer_id": None,
+                        "call_count": 0,
+                        "skip_count": 0,
+                        "last_result": None,
+                        "config": None,
+                    }
+                    logger.info("[CacheDiT] Lightweight cache state reset")
+        except Exception as e:
+            logger.warning(f"[CacheDiT] Failed to fully restore model: {e}")
         
         return (model,)
-
 
 # =============================================================================
 # Node Registration

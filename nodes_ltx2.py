@@ -144,10 +144,10 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
         last_shape = state.get("last_input_shape")
         if current_input_shape is not None and last_shape is not None:
             if current_input_shape != last_shape:
-                logger.info(
-                    f"[LTX2-Cache] Input shape changed: {last_shape} → {current_input_shape}, "
-                    "clearing cache (likely upscale stage)"
-                )
+                # logger.info(
+                #     f"[LTX2-Cache] Input shape changed: {last_shape} → {current_input_shape}, "
+                #     "clearing cache (likely upscale stage)"
+                # )
                 state["last_result"] = None
                 state["current_timestep"] = None
                 state["timestep_count"] = 0
@@ -171,19 +171,19 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             timestep = kwargs['v_timestep']
         
         # DEBUG: Log what we're intercepting
-        if state["call_count"] == 1:
-            logger.info(f"[LTX2-Cache] Intercepting forward: args={len(args)}, kwargs={list(kwargs.keys())[:10]}")
-            if timestep is not None:
-                ts_type = type(timestep)
-                if isinstance(timestep, torch.Tensor):
-                    ts_info = f"shape={tuple(timestep.shape)}, values={timestep.flatten()[:5].tolist() if timestep.numel() <= 10 else timestep.flatten()[:5].tolist()}"
-                elif isinstance(timestep, (tuple, list)):
-                    ts_info = f"len={len(timestep)}"
-                    if len(timestep) > 0 and isinstance(timestep[0], torch.Tensor):
-                        ts_info += f", first_elem_shape={tuple(timestep[0].shape)}, first_values={timestep[0].flatten()[:5].tolist()}"
-                else:
-                    ts_info = f"value={timestep}"
-                logger.info(f"[LTX2-Cache] timestep type: {ts_type}, {ts_info}")
+        # if state["call_count"] == 1:
+            # logger.info(f"[LTX2-Cache] Intercepting forward: args={len(args)}, kwargs={list(kwargs.keys())[:10]}")
+            # if timestep is not None:
+            #     ts_type = type(timestep)
+            #     if isinstance(timestep, torch.Tensor):
+            #         ts_info = f"shape={tuple(timestep.shape)}, values={timestep.flatten()[:5].tolist() if timestep.numel() <= 10 else timestep.flatten()[:5].tolist()}"
+            #     elif isinstance(timestep, (tuple, list)):
+            #         ts_info = f"len={len(timestep)}"
+            #         if len(timestep) > 0 and isinstance(timestep[0], torch.Tensor):
+            #             ts_info += f", first_elem_shape={tuple(timestep[0].shape)}, first_values={timestep[0].flatten()[:5].tolist()}"
+            #     else:
+            #         ts_info = f"value={timestep}"
+                # logger.info(f"[LTX2-Cache] timestep type: {ts_type}, {ts_info}")
         
         # Track unique timesteps
         current_ts = None
@@ -241,20 +241,20 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             
             # I2V detection: if first timestep is ~0, enable call-count tracking
             if state["timestep_count"] == 1 and abs(current_ts) < 0.001:
-                logger.info(f"[LTX2-Cache] Detected I2V mode (t≈0), using conservative call-based warmup")
+                # logger.info(f"[LTX2-Cache] Detected I2V mode (t≈0), using conservative call-based warmup")
                 state["i2v_mode"] = True
             
             # Calculate calls per step for T2V detection
             if state["timestep_count"] == 2:
                 calls_per_step = state["call_count"] - state["last_timestep_call"]
                 state["calls_per_step"] = calls_per_step
-                logger.info(f"[LTX2-Cache] Detected ~{calls_per_step} calls per step (T2V mode)")
+                # logger.info(f"[LTX2-Cache] Detected ~{calls_per_step} calls per step (T2V mode)")
             
             state["last_timestep_call"] = state["call_count"]
             
             # Log timestep transitions
-            if timestep_id <= 3:
-                logger.info(f"[LTX2-Cache] Timestep {timestep_id}: t={current_ts:.4f}")
+            # if timestep_id <= 3:
+            #     logger.info(f"[LTX2-Cache] Timestep {timestep_id}: t={current_ts:.4f}")
         else:
             # Timestep unchanged - use call count for step estimation
             if state["calls_per_step"] is not None and state["calls_per_step"] > 0:
@@ -263,8 +263,8 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
                 timestep_id = max(estimated_step, state["timestep_count"])
                 
                 # Log progress for T2V mode
-                if state["call_count"] in [50, 100, 150] and state["timestep_count"] == 1:
-                    logger.info(f"[LTX2-Cache] Call-count tracking: call {state['call_count']}, estimated step {estimated_step}")
+                # if state["call_count"] in [50, 100, 150] and state["timestep_count"] == 1:
+                #     logger.info(f"[LTX2-Cache] Call-count tracking: call {state['call_count']}, estimated step {estimated_step}")
             else:
                 # No calls_per_step yet - could be I2V or early T2V
                 timestep_id = state["timestep_count"]
@@ -668,28 +668,51 @@ class CacheDiT_LTX2_Optimizer:
         """Apply LTX-2 specific cache optimization."""
         
         if not enable:
-            logger.info("[LTX2-Cache] ⏸️ Optimization disabled")
-            return (model,)
+            logger.info("[CacheDiT] Optimization disabled, model restored")
+            return self.disable(model)
         
-        # Detect LTX-2 model
+        # Detect LTX-2 model and check existing config
         try:
             diffusion_model = model.model.diffusion_model
             model_class_name = diffusion_model.__class__.__name__
             
             if model_class_name != "LTXAVModel":
                 logger.warning(
-                    f"[LTX2-Cache] ⚠️ Not LTX-2 model (detected: {model_class_name}), "
+                    f"[LTX2-Cache] Not LTX-2 model (detected: {model_class_name}), "
                     "optimization skipped"
                 )
                 return (model,)
             
-            logger.info(f"[LTX2-Cache] ✓ Detected LTX-2 model: {model_class_name}")
+            # Check existing configuration
+            existing_config = getattr(diffusion_model, '_ltx2_cache_config', None)
+            
+            if existing_config is not None:
+                # Compare parameters
+                params_changed = (
+                    existing_config["warmup_steps"] != warmup_steps or
+                    existing_config["skip_interval"] != skip_interval or
+                    existing_config["noise_scale"] != noise_scale or
+                    existing_config["print_summary"] != print_summary
+                )
+                
+                if params_changed:
+                    logger.info(
+                        f"[LTX2-Cache] Parameters changed: "
+                        f"warmup {existing_config['warmup_steps']}→{warmup_steps}, "
+                        f"skip {existing_config['skip_interval']}→{skip_interval}"
+                    )
+                    # Disable and reconfigure
+                    result = self.disable(model)
+                    model = result[0]
+                else:
+                    logger.info("[LTX2-Cache] Configuration unchanged")
+                    return (model,)
         
         except Exception as e:
             logger.error(f"[LTX2-Cache] Failed to detect model: {e}")
             return (model,)
         
-        # Clone model
+        # Clone model for new configuration
         model = model.clone()
         
         # Create config
@@ -701,24 +724,31 @@ class CacheDiT_LTX2_Optimizer:
             print_summary=print_summary,
         )
         
-        # Store config in transformer_options
+        # Store config in both transformer_options and transformer object
         if "transformer_options" not in model.model_options:
             model.model_options["transformer_options"] = {}
         
         model.model_options["transformer_options"]["ltx2_cache"] = config
         
-        # Register wrapper using ComfyUI's patcher_extension system (same as main node)
+        # Store simplified config on transformer for persistence
+        diffusion_model._ltx2_cache_config = {
+            "warmup_steps": warmup_steps,
+            "skip_interval": skip_interval,
+            "noise_scale": noise_scale,
+            "print_summary": print_summary,
+        }
+        
+        # Register wrapper
         try:
             import comfy.patcher_extension
             
-            # Use add_wrapper_with_key (3 args: wrapper_type, key, function)
             model.add_wrapper_with_key(
                 comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
                 "ltx2_cache",
                 _ltx2_outer_sample_wrapper
             )
             
-            logger.info("[LTX2-Cache] ✓ Wrapper registered via patcher_extension")
+            logger.info("[LTX2-Cache] Wrapper registered")
         
         except Exception as e:
             logger.error(f"[LTX2-Cache] Failed to register wrapper: {e}")
@@ -729,12 +759,58 @@ class CacheDiT_LTX2_Optimizer:
             f"skip={skip_interval}, noise={noise_scale:.4f}"
         )
         
-        # Provide recommendations if using aggressive settings
+        # Recommendations
         if warmup_steps < 8 or skip_interval < 6:
             logger.info(
-                f"[LTX2-Cache] 💡 Current settings are aggressive (warmup={warmup_steps}, skip={skip_interval}). "
+                f"[LTX2-Cache] Aggressive settings (warmup={warmup_steps}, skip={skip_interval}). "
                 "For better quality, try: warmup=8-10, skip=3-4"
             )
+        
+        return (model,)
+    
+    def disable(self, model):
+        """Disable LTX-2 cache optimization."""
+        model = model.clone()
+        
+        # Remove config
+        if "ltx2_cache" in model.model_options.get("transformer_options", {}):
+            del model.model_options["transformer_options"]["ltx2_cache"]
+        
+        # Remove wrapper
+        if "ltx2_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
+            del model.wrappers[comfy.patcher_extension.WrappersMP.OUTER_SAMPLE]["ltx2_cache"]
+        
+        # Restore original forward and clear cache state
+        try:
+            if hasattr(model.model, 'diffusion_model'):
+                transformer = model.model.diffusion_model
+                
+                # Restore original forward
+                if hasattr(transformer, '_original_forward'):
+                    transformer.forward = transformer._original_forward
+                    delattr(transformer, '_original_forward')
+                    logger.info("[LTX2-Cache] Restored original forward")
+                
+                # Clear config marker
+                if hasattr(transformer, '_ltx2_cache_config'):
+                    delattr(transformer, '_ltx2_cache_config')
+                
+                # Reset global cache state
+                global _ltx2_cache_state
+                _ltx2_cache_state = {
+                    "enabled": False,
+                    "transformer_id": None,
+                    "call_count": 0,
+                    "skip_count": 0,
+                    "compute_count": 0,
+                    "last_result": None,
+                    "config": None,
+                    "compute_times": [],
+                }
+                logger.info("[LTX2-Cache] Cache state reset")
+        
+        except Exception as e:
+            logger.warning(f"[LTX2-Cache] Failed to fully restore: {e}")
         
         return (model,)
 
