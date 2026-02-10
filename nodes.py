@@ -50,8 +50,11 @@ _lightweight_cache_state = {
     "transformer_id": None,
     "call_count": 0,
     "skip_count": 0,
+    "compute_count": 0,
     "last_result": None,
     "config": None,
+    "cache_config": None,
+    "compute_times": [],
 }
 
 
@@ -60,8 +63,19 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     global _lightweight_cache_state
     
     if hasattr(transformer, '_original_forward'):
-        logger.warning("[LightweightCache] Transformer already patched, skipping")
-        return
+        current_id = id(transformer)
+        cached_id = _lightweight_cache_state.get("transformer_id")
+        
+        if current_id == cached_id:
+            logger.info("[Lightweight-Cache] Already enabled, resetting state")
+            _lightweight_cache_state.update({
+                "call_count": 0,
+                "skip_count": 0,
+                "compute_count": 0,
+                "last_result": None,
+                "compute_times": [],
+            })
+            return
     
     transformer._original_forward = transformer.forward
     _lightweight_cache_state = {
