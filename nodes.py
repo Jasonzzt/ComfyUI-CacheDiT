@@ -58,29 +58,53 @@ _lightweight_cache_state = {
 }
 
 
+def _cleanup_transformer_cache(transformer):
+    """Remove all cache-related attributes from transformer"""
+    if hasattr(transformer, '_original_forward'):
+        try:
+            transformer.forward = transformer._original_forward
+            delattr(transformer, '_original_forward')
+            logger.info(f"[Lightweight-Cache] Cleaned up transformer {id(transformer)}")
+        except Exception as e:
+            logger.warning(f"[Lightweight-Cache] Cleanup failed: {e}")
+
+
+
 def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     """Enable lightweight cache by replacing transformer.forward"""
     global _lightweight_cache_state
     
-    if hasattr(transformer, '_original_forward'):
-        current_id = id(transformer)
-        cached_id = _lightweight_cache_state.get("transformer_id")
-        
-        if current_id == cached_id:
-            logger.info("[Lightweight-Cache] Already enabled, resetting state")
-            _lightweight_cache_state.update({
-                "call_count": 0,
-                "skip_count": 0,
-                "compute_count": 0,
-                "last_result": None,
-                "compute_times": [],
-            })
-            return
+    current_id = id(transformer)
+    cached_id = _lightweight_cache_state.get("transformer_id")
     
+    # Log transformer changes
+    if cached_id is not None and current_id != cached_id:
+        logger.info(f"[Lightweight-Cache] Switching transformer (old ID: {cached_id}, new ID: {current_id})")
+        # Force memory cleanup when switching transformers
+        try:
+            import gc
+            gc.collect()
+            if torch.xpu.is_available():
+                torch.xpu.empty_cache()
+                logger.info("[Lightweight-Cache] Memory cleanup on transformer switch")
+        except Exception as e:
+            logger.debug(f"[Lightweight-Cache] Memory cleanup warning: {e}")
+    elif cached_id == current_id:
+        logger.info(f"[Lightweight-Cache] Re-enabling for same transformer (ID: {current_id})")
+    
+    # CRITICAL: Always cleanup existing cache state on this transformer
+    # This ensures we start completely fresh every time
+    _cleanup_transformer_cache(transformer)
+    
+    # Store original forward (now guaranteed to be the real original)
     transformer._original_forward = transformer.forward
-    _lightweight_cache_state = {
+    logger.info(f"[Lightweight-Cache] Saved original forward for transformer {current_id}")
+    
+    # ALWAYS completely reset global state
+    _lightweight_cache_state.clear()
+    _lightweight_cache_state.update({
         "enabled": True,
-        "transformer_id": id(transformer),
+        "transformer_id": current_id,
         "call_count": 0,
         "skip_count": 0,
         "compute_count": 0,
@@ -88,10 +112,24 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
         "config": config,
         "cache_config": cache_config,
         "compute_times": [],
-    }
+    })
     
     # === Model-specific adaptive parameters ===
     transformer_class = transformer.__class__.__name__
+    transformer_module = transformer.__class__.__module__
+    
+    # Enhanced Flux2 detection for display
+    display_name = transformer_class
+    if "Flux" in transformer_class or "FLUX" in transformer_class:
+        if "flux2" in transformer_module.lower() or "flux_2" in transformer_module.lower():
+            display_name = "Flux2"
+        elif hasattr(transformer, 'config') and hasattr(transformer.config, 'model_type'):
+            if "flux2" in str(transformer.config.model_type).lower():
+                display_name = "Flux2"
+        elif hasattr(transformer, '_model_name'):
+            if "flux2" in str(transformer._model_name).lower():
+                display_name = "Flux2"
+    
     total_steps = config.num_inference_steps if config.num_inference_steps else 28
     
     # Check if user provided overrides
@@ -133,14 +171,6 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
         if skip_interval is None:
             skip_interval = 3  # Skip 33% of post-warmup steps (compute, compute, skip)
         noise_scale = 0.0  # Z-Image: NO noise injection
-            
-    elif "Lumina" in transformer_class:
-        # Lumina2: simpler architecture, can skip more aggressively
-        if warmup_steps is None:
-            warmup_steps = min(3, total_steps // 3)
-        if skip_interval is None:
-            skip_interval = 2
-        noise_scale = 0.0
     
     elif "QwenImage" in transformer_class or "Qwen" in transformer_class:
         # Qwen-Image: quality-sensitive, use conservative settings
@@ -155,8 +185,8 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
                 skip_interval = 3  # 25% skip for very long sequences
         noise_scale = config.noise_scale if hasattr(config, 'noise_scale') else 0.0
     
-    elif "Flux" in transformer_class or "FLUX" in transformer_class:
-        # FLUX: well-tested, balanced approach
+    elif "Flux" in transformer_class or "FLUX" in transformer_class or "Flux2" in transformer_class or "FLUX2" in transformer_class:
+        # FLUX (including FLUX.1 and FLUX.2): well-tested, balanced approach
         if warmup_steps is None:
             warmup_steps = min(3, total_steps // 4)
         if skip_interval is None:
@@ -258,7 +288,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     
     logger.info(
         f"[CacheDiT] Lightweight cache enabled: "
-        f"model={transformer_class}, steps={total_steps}, "
+        f"model={display_name}, steps={total_steps}, "
         f"warmup={warmup_steps}, skip_interval={skip_interval}"
     )
 
@@ -388,6 +418,7 @@ class CacheDiTConfig:
         """Reset runtime state for new generation."""
         self.current_step = 0
         self.first_step_done = False
+        self.is_enabled = False  # Reset for new transformer/workflow
     
     def get_config_info(self) -> Dict[str, Any]:
         """Get config as dict for summary display."""
@@ -436,6 +467,17 @@ def _cache_dit_outer_sample_wrapper(executor, *args, **kwargs):
         config.reset()
         guider.model_options["transformer_options"]["cache_dit_turbo"] = config
         
+        # CRITICAL: Force reset global lightweight cache state at sampling start
+        # This ensures clean state even if previous sampling was interrupted
+        global _lightweight_cache_state
+        if _lightweight_cache_state.get("enabled"):
+            logger.info("[CacheDiT] Forcing global state reset at sampling start")
+            _lightweight_cache_state["call_count"] = 0
+            _lightweight_cache_state["skip_count"] = 0
+            _lightweight_cache_state["compute_count"] = 0
+            _lightweight_cache_state["last_result"] = None
+            _lightweight_cache_state["compute_times"] = []
+        
         # =====================================================================
         # SMART STEP DETECTION: Extract num_inference_steps from sigmas
         # =====================================================================
@@ -452,8 +494,23 @@ def _cache_dit_outer_sample_wrapper(executor, *args, **kwargs):
         if hasattr(model_patcher, 'model') and hasattr(model_patcher.model, 'diffusion_model'):
             transformer = model_patcher.model.diffusion_model
             
+            # Check if transformer changed (force re-enable for different models)
+            current_transformer_id = id(transformer)
+            cached_transformer_id = _lightweight_cache_state.get("transformer_id")
+            transformer_changed = (cached_transformer_id is not None and 
+                                   current_transformer_id != cached_transformer_id)
+            
+            # Debug: log state before enable/refresh
+            if config.verbose or transformer_changed:
+                logger.info(
+                    f"[CacheDiT] Before enable/refresh: "
+                    f"current_id={current_transformer_id}, cached_id={cached_transformer_id}, "
+                    f"transformed_changed={transformer_changed}, is_enabled={config.is_enabled}, "
+                    f"state_call_count={_lightweight_cache_state.get('call_count', 'N/A')}"
+                )
+            
             # Enable or refresh cache-dit
-            if not config.is_enabled and config.num_inference_steps is not None:
+            if (not config.is_enabled or transformer_changed) and config.num_inference_steps is not None:
                 _enable_cache_dit(transformer, config)
                 config.is_enabled = True
             elif config.is_enabled and config.num_inference_steps is not None:
@@ -608,18 +665,33 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         
         # === Check if lightweight cache should be used directly ===
         transformer_class_name = transformer.__class__.__name__
+        transformer_module = transformer.__class__.__module__
         
+        # Enhanced Flux2 detection
+        detected_name = transformer_class_name
+        if "Flux" in transformer_class_name or "FLUX" in transformer_class_name:
+            # Check module name for flux2
+            if "flux2" in transformer_module.lower() or "flux_2" in transformer_module.lower():
+                detected_name = "Flux2"
+            # Check model config if available
+            elif hasattr(transformer, 'config') and hasattr(transformer.config, 'model_type'):
+                if "flux2" in str(transformer.config.model_type).lower():
+                    detected_name = "Flux2"
+            elif hasattr(transformer, '_model_name'):
+                if "flux2" in str(transformer._model_name).lower():
+                    detected_name = "Flux2"
+        
+        print(f"[CacheDiT] Transformer class: {detected_name} (module: {transformer_module})")
         # ComfyUI models typically don't work well with cache-dit BlockAdapter
         # Use lightweight cache directly for better compatibility
         use_lightweight = transformer_class_name in [
             "NextDiT",        # Z-Image
-            "Lumina",         # Lumina
             "QwenImage",      # Qwen-Image
-            "HunyuanVideo",   # HunyuanVideo
+            "Flux",           # Flux.1 and Flux.2
         ]
         
         if use_lightweight:
-            logger.info(f"[CacheDiT] Using lightweight cache for {transformer_class_name}")
+            logger.info(f"[CacheDiT] Using lightweight cache for {detected_name}")
             _enable_lightweight_cache(
                 transformer=transformer,
                 blocks=manual_blocks,
@@ -716,18 +788,17 @@ def _refresh_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
             _lightweight_cache_state["config"] = config
             _lightweight_cache_state["transformer_id"] = current_transformer_id
             
-            # Log only if verbose or transformer changed (different model/step in workflow)
-            if config.verbose:
-                if previous_transformer_id != current_transformer_id:
-                    logger.info(
-                        f"[CacheDiT] Lightweight cache reset for new sampling: "
-                        f"{config.num_inference_steps} steps (transformer changed)"
-                    )
-                else:
-                    logger.info(
-                        f"[CacheDiT] Lightweight cache reset for new sampling: "
-                        f"{config.num_inference_steps} steps"
-                    )
+            # Log refresh (always log for debugging)
+            if previous_transformer_id != current_transformer_id:
+                logger.info(
+                    f"[CacheDiT] Lightweight cache refresh: "
+                    f"{config.num_inference_steps} steps (transformer changed, old={previous_transformer_id}, new={current_transformer_id})"
+                )
+            else:
+                logger.info(
+                    f"[CacheDiT] Lightweight cache refresh: "
+                    f"{config.num_inference_steps} steps (same transformer={current_transformer_id})"
+                )
             return
         
         # Standard cache-dit refresh
@@ -776,7 +847,7 @@ class CacheDiT_Model_Optimizer:
     Accelerates DiT model inference through inter-step residual caching.
     Automatically detects inference steps and refreshes context.
     
-    Supports: Qwen-Image, Z-Image, Flux, HunyuanVideo, Wan, and custom models.
+    Supports: Qwen-Image, Z-Image.
     """
     
     @classmethod
@@ -866,9 +937,9 @@ class CacheDiT_Model_Optimizer:
                     class_name = transformer.__class__.__name__
                     if "Qwen" in class_name:
                         resolved_model_type = "Qwen-Image"
-                    elif "NextDiT" in class_name or "Lumina" in class_name:
+                    elif "NextDiT" in class_name:
                         resolved_model_type = "Z-Image"
-                    elif "Flux" in class_name or "FLUX" in class_name:
+                    elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
                         resolved_model_type = "Flux"
                     else:
                         resolved_model_type = "Custom"
@@ -910,9 +981,9 @@ class CacheDiT_Model_Optimizer:
                 # Map common class names to presets
                 if "Qwen" in class_name:
                     model_type = "Qwen-Image"
-                elif "NextDiT" in class_name or "Lumina" in class_name:
+                elif "NextDiT" in class_name:
                     model_type = "Z-Image"
-                elif "Flux" in class_name or "FLUX" in class_name:
+                elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
                     model_type = "Flux"
                 else:
                     model_type = "Custom"
@@ -996,10 +1067,8 @@ class CacheDiT_Model_Optimizer:
             if hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
                 transformer = model.model.diffusion_model
                 
-                # Restore lightweight cache forward method
-                if hasattr(transformer, '_original_forward'):
-                    transformer.forward = transformer._original_forward
-                    delattr(transformer, '_original_forward')
+                # Cleanup lightweight cache using dedicated function
+                _cleanup_transformer_cache(transformer)
                 
                 # Disable standard cache-dit
                 try:
