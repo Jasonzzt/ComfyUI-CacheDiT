@@ -44,6 +44,8 @@ Inspired by [**llm-scaler**](https://github.com/intel/llm-scaler), a high-perfor
 | **Z-Image** | 50 | 1.3x | 10 | 5 |
 | **Z-Image-Turbo** | 9 | 1.5x | 3 | 2 |
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | 5 | 3 |
+| **Flux.2 Klein 4B** | 20 | 1.67x | 4 | 2 |
+| **Flux.2 Klein 9B** | 20 | 1.67x | 4 | 2 |
 | **LTX-2 T2V** | 20 | 2.0x | 6 | 4 |
 | **LTX-2 I2V** | 20 | 2.0x | 6 | 4 |
 | **WAN2.2 14B T2V** | 20 | 1.67x | 4 | 2 |
@@ -72,7 +74,7 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 
 ### Ultra-Simple Usage (3 Steps)
 
-**For Image Models (Z-Image, Qwen-Image):**
+**For Image Models (Z-Image, Qwen-Image Flux.2 Klein):**
 
 1. Load your model
 2. Connect to **⚡ CacheDiT Accelerator** node

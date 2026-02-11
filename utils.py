@@ -127,6 +127,26 @@ MODEL_PRESETS: Dict[str, ModelPreset] = {
     ),
     
     # =========================================================================
+    # Flux Series (supports Flux.1 and Flux.2)
+    # =========================================================================
+    "Flux": ModelPreset(
+        name="Flux",
+        description="Flux (balanced caching, supports Flux.1 and Flux.2)",
+        description_cn="Flux (平衡缓存，支持 Flux.1 和 Flux.2)",
+        forward_pattern="Pattern_0",
+        fn_blocks=8,
+        bn_blocks=0,
+        threshold=0.12,
+        max_warmup_steps=4,
+        enable_separate_cfg=True,
+        cfg_compute_first=False,
+        skip_interval=0,
+        noise_scale=0.0,
+        default_strategy="adaptive",
+        taylor_order=1,
+    ),
+    
+    # =========================================================================
     # LTX-2 Video Series
     # =========================================================================
     # LTX-2 is an Audio-Visual Transformer that processes dual latent paths:
@@ -392,7 +412,7 @@ def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.
     Manually extract transformer blocks from ComfyUI models.
     
     This is necessary because cache-dit's auto-detection fails on non-diffusers
-    architectures like NextDiT (Z-Image/Lumina), Flux, LTX-2, etc.
+    architectures like NextDiT (Z-Image), Flux (including Flux.2), LTX-2, etc.
     
     Returns:
         List of blocks if found, None otherwise
@@ -400,7 +420,7 @@ def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.
     blocks = []
     transformer_class = transformer.__class__.__name__.lower()
     
-    # Strategy 1: Z-Image / Lumina2 (NextDiT architecture)
+    # Strategy 1: Z-Image (NextDiT architecture)
     # These models store blocks in .layers attribute
     if hasattr(transformer, 'layers'):
         layers = transformer.layers
@@ -545,7 +565,7 @@ def format_summary_dashboard(
         lines.append("╔" + "═" * (width - 2) + "╗")
         lines.append("║" + "CacheDiT Summary: No statistics available".center(width - 2) + "║")
         lines.append("╠" + "═" + (width - 2) + "╣")
-        lines.append("║" + "⚠️  Cache may not be active. Check:".ljust(width - 2) + "║")
+        lines.append("║" + " Cache may not be active. Check:".ljust(width - 2) + "║")
         lines.append("║" + "   1. Threshold may be too strict".ljust(width - 2) + "║")
         lines.append("║" + "   2. Model may not support caching".ljust(width - 2) + "║")
         lines.append("║" + "   3. Check logs for errors".ljust(width - 2) + "║")
@@ -598,7 +618,7 @@ def format_summary_dashboard(
     lines.append("╠" + "─" * (width - 2) + "╣")
     
     # Quality metrics
-    lines.append("║" + "  🎯 Quality Metrics".ljust(width - 2) + "║")
+    lines.append("║" + "  Quality Metrics".ljust(width - 2) + "║")
     lines.append("║" + "─" * (width - 4) + "  ║")
     
     quality_metrics = [
@@ -615,7 +635,7 @@ def format_summary_dashboard(
     # Advanced settings if present
     if config_info.get("skip_interval", 0) > 0 or config_info.get("noise_scale", 0) > 0:
         lines.append("╠" + "─" * (width - 2) + "╣")
-        lines.append("║" + "  ⚙️  Advanced Settings".ljust(width - 2) + "║")
+        lines.append("║" + "   Advanced Settings".ljust(width - 2) + "║")
         lines.append("║" + "─" * (width - 4) + "  ║")
         
         if config_info.get("skip_interval", 0) > 0:
@@ -630,7 +650,7 @@ def format_summary_dashboard(
     
     # Speedup visualization bar
     lines.append("╠" + "─" * (width - 2) + "╣")
-    lines.append("║" + "  🚀 Speedup Visualization".ljust(width - 2) + "║")
+    lines.append("║" + "  Speedup Visualization".ljust(width - 2) + "║")
     
     bar_width = width - 12
     filled = int((speedup - 1.0) / 2.0 * bar_width)  # Scale 1x-3x to bar
@@ -644,7 +664,7 @@ def format_summary_dashboard(
     
     # Add troubleshooting tips if cache hit rate is 0
     if cache_hit_rate == 0 and total_steps > 0:
-        lines.append("║" + "⚠️  TROUBLESHOOTING: Cache Hit Rate is 0%".center(width - 2) + "║")
+        lines.append("║" + " TROUBLESHOOTING: Cache Hit Rate is 0%".center(width - 2) + "║")
         lines.append("╠" + "─" * (width - 2) + "╣")
         lines.append("║" + "  Possible fixes:".ljust(width - 2) + "║")
         lines.append("║" + f"  • Increase threshold (current: {config_info.get('threshold', 0):.4f})".ljust(width - 2) + "║")
