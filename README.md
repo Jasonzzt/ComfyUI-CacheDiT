@@ -116,26 +116,16 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 
 ## How It Works
 
-### Intelligent Fallback System
-
-ComfyUI-CacheDiT uses a **two-tier acceleration approach**:
-
-1. **Primary**: cache-dit library with DBCache algorithm
-2. **Fallback**: Lightweight cache (direct forward hook replacement)
-
-For ComfyUI models (Qwen-Image, Z-Image, etc.), the lightweight cache automatically activates because cache-dit's BlockAdapter cannot track non-standard model architectures.
-
-
 **Caching Logic**:
 ```python
 # After warmup phase (first 3 steps)
 if (current_step - warmup) % skip_interval == 0:
+    # Reuse cached result
+    result = cache
+else:
     # Compute new result
     result = transformer.forward(...)
     cache = result.detach()  # Save to cache
-else:
-    # Reuse cached result
-    result = cache
 ```
 
 ## Credits
