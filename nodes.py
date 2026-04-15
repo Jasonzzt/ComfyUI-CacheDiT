@@ -33,10 +33,6 @@ from .utils import (
     apply_noise_injection,
 )
 
-try:
-    from cache_dit.caching import ForwardPattern
-except ImportError:
-    ForwardPattern = None
 
 if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
