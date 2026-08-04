@@ -46,6 +46,7 @@ Inspired by [**llm-scaler**](https://github.com/intel/llm-scaler), a high-perfor
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | 5 | 3 |
 | **Flux.2 Klein 4B** | 20 | 1.67x | 4 | 2 |
 | **Flux.2 Klein 9B** | 20 | 1.67x | 4 | 2 |
+| **MiniMax H3** | 20 | Integration validated | 3 | Adaptive DBCache |
 | **LTX-2 T2V** | 20 | 2.0x | 6 | 4 |
 | **LTX-2 I2V** | 20 | 2.0x | 6 | 4 |
 | **WAN2.2 14B T2V** | 20 | 1.67x | 4 | 2 |
@@ -84,7 +85,15 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 [Load Checkpoint] → [⚡ CacheDiT Accelerator] → [KSampler]
 ```
 
-**For Video Models (LTX-2, WAN2.2 14B):**
+**For Video Models (MiniMax H3, LTX-2, WAN2.2 14B):**
+
+**MiniMax H3:**
+```
+[Load Diffusion Model] → [⚡ CacheDiT Accelerator] → [Model Sampling / Guider]
+```
+The `Auto` preset detects `MiniMaxH3Model` and enables Pattern 3 DBCache with
+in-place-safe residual boundaries for its joint audio-video transformer.
+
 
 **LTX-2 Models:**
 ```

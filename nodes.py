@@ -631,7 +631,7 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         from cache_dit import BlockAdapter
         
         # For ComfyUI models, manually extract blocks
-        from .utils import _manual_extract_blocks
+        from .utils import _manual_extract_blocks, prepare_block_adapter_blocks
         
         manual_blocks = _manual_extract_blocks(transformer)
         if not manual_blocks or len(manual_blocks) == 0:
@@ -699,18 +699,30 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
         # === Attempt to use cache-dit's BlockAdapter ===
         cache_dit_failed = False
         try:
-            # Standard models: ensure blocks are ModuleList
-            blocks_module_list = manual_blocks
-            if not isinstance(manual_blocks, torch.nn.ModuleList):
-                blocks_module_list = torch.nn.ModuleList(manual_blocks)
-                logger.info(f"[CacheDiT] Converted {len(manual_blocks)} blocks to ModuleList")
-            
-            # Inject blocks into transformer for cache-dit auto-detection
-            if not hasattr(transformer, 'blocks'):
-                transformer.blocks = blocks_module_list
-                logger.info(f"[CacheDiT] Injected blocks into transformer.blocks")
-            
-            adapter = BlockAdapter(blocks=blocks_module_list)
+            clone_input_indices = []
+            if config.model_type == "MiniMax-H3":
+                # MiniMax H3 DiT blocks update x in place.  DBCache keeps
+                # references at the Fn and Mn boundaries, so clone only the
+                # first block input at each boundary to preserve residuals.
+                clone_input_indices = [0, config.fn_blocks]
+
+            blocks_module_list, blocks_name = prepare_block_adapter_blocks(
+                transformer,
+                manual_blocks,
+                clone_input_indices=clone_input_indices,
+            )
+            if clone_input_indices:
+                logger.info(
+                    f"[CacheDiT] Added in-place-safe residual boundaries at blocks "
+                    f"{clone_input_indices}"
+                )
+
+            adapter = BlockAdapter(
+                transformer=transformer,
+                blocks=blocks_module_list,
+                blocks_name=blocks_name,
+                forward_pattern=pattern,
+            )
             
             # Verify adapter has blocks
             if not hasattr(adapter, 'blocks') or len(adapter.blocks) == 0:
@@ -937,6 +949,8 @@ class CacheDiT_Model_Optimizer:
                         resolved_model_type = "Z-Image"
                     elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
                         resolved_model_type = "Flux"
+                    elif "MiniMaxH3" in class_name:
+                        resolved_model_type = "MiniMax-H3"
                     else:
                         resolved_model_type = "Custom"
                 else:
@@ -981,6 +995,8 @@ class CacheDiT_Model_Optimizer:
                     model_type = "Z-Image"
                 elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
                     model_type = "Flux"
+                elif "MiniMaxH3" in class_name:
+                    model_type = "MiniMax-H3"
                 else:
                     model_type = "Custom"
                     logger.info(f"[CacheDiT] Auto-detected unknown model: {class_name}, using Custom preset")
