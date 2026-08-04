@@ -25,9 +25,10 @@
 
 </div>
 
----
 
 <a name="english"></a>
+## Latest Update
+🔥[2026.08] We added MiniMax-H3 support in ComfyUI-CacheDiT, validated on official T2V, I2V, and R2V workflows with same-seed comparisons, achieving **1.41-1.50x speedup** while preserving native video output and stereo audio.
 
 ## Overview
 
