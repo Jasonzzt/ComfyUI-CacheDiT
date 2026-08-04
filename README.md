@@ -46,12 +46,16 @@ Inspired by [**llm-scaler**](https://github.com/intel/llm-scaler), a high-perfor
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | 5 | 3 |
 | **Flux.2 Klein 4B** | 20 | 1.67x | 4 | 2 |
 | **Flux.2 Klein 9B** | 20 | 1.67x | 4 | 2 |
+| **MiniMax H3** | 20 | 1.41-1.50x | 3 | N/A (adaptive) |
 | **LTX-2 T2V** | 20 | 2.0x | 6 | 4 |
 | **LTX-2 I2V** | 20 | 2.0x | 6 | 4 |
 | **WAN2.2 14B T2V** | 20 | 1.67x | 4 | 2 |
 | **WAN2.2 14B I2V** | 20 | 1.67x | 4 | 2 |
 
 </div>
+
+MiniMax H3 uses residual-difference-based adaptive DBCache decisions rather
+than a fixed `skip_interval`, so that column is not applicable to H3.
 
 ## Installation
 
@@ -84,7 +88,34 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 [Load Checkpoint] → [⚡ CacheDiT Accelerator] → [KSampler]
 ```
 
-**For Video Models (LTX-2, WAN2.2 14B):**
+**For Video Models (MiniMax H3, LTX-2, WAN2.2 14B):**
+
+**MiniMax H3:**
+```
+[Load Diffusion Model] → [⚡ CacheDiT Accelerator] → [Model Sampling / Guider]
+```
+The `Auto` preset detects `MiniMaxH3Model` and enables Pattern 3 DBCache with
+in-place-safe residual boundaries for its joint audio-video transformer.
+
+For explicit H3 tuning, use the optional **⚡ CacheDiT MiniMax H3 Advanced**
+node in the same position. It exposes only the four H3 DBCache controls that
+are useful for workflow-level quality/speed tuning; `Auto` remains the
+recommended starting point.
+
+The initial H3 preset is `F8 / B0 / threshold 0.12 / warmup 3`:
+
+| Control | Initial value | Meaning and initial-setting rationale |
+|---------|---------------|---------------------------------------|
+| `fn_blocks` | 8 | Always execute the first 8 blocks. This gives the residual comparison an early, current-step signal while leaving most blocks eligible for reuse. |
+| `bn_blocks` | 0 | Do not recompute tail blocks on a cache hit. This is the initial performance-oriented setting; raise it if a workflow needs more conservative tail refinement. |
+| `residual_diff_threshold` | 0.12 | Reuse the middle-block residual when the normalized residual difference stays below 0.12. Lower values are more conservative; higher values usually increase cache hits and quality risk. |
+| `warmup_steps` | 3 | Fully compute steps 0, 1, and 2; adaptive cache reuse becomes eligible at step 3. |
+
+These values are a validated integration baseline, not a model-wide optimum.
+T2V, I2V, and R2V workflows can respond differently to the same cache
+settings. Tune one control at a time and compare the same workflow, seed,
+steps, resolution, frame count, audio settings, and output codec.
+
 
 **LTX-2 Models:**
 ```
@@ -108,11 +139,14 @@ git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
 | `model` | MODEL | - | Input model (required) |
 | `enable` | Boolean | True | Enable/disable acceleration |
 | `model_type` | Combo | Auto | Auto-detect or select preset |
+| `warmup_steps` | Integer | 0 | Generic node: 0 uses the selected preset |
+| `skip_interval` | Integer | 0 | Generic node: 0 uses the selected preset |
 | `print_summary` | Boolean | True | Show performance dashboard |
 
 </div>
 
-**That's it!** All technical parameters (threshold, fn_blocks, warmup, etc.) are automatically configured based on your model type.
+**That's it!** The generic node configures technical parameters automatically.
+Use the H3 Advanced node only when you need explicit H3 workflow tuning.
 
 ## How It Works
 

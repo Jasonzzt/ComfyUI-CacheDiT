@@ -68,6 +68,56 @@ class ModelPreset:
         }
 
 
+def resolve_cache_parameters(
+    preset: ModelPreset,
+    *,
+    warmup_steps: Optional[int] = None,
+    skip_interval: Optional[int] = None,
+    fn_blocks: Optional[int] = None,
+    bn_blocks: Optional[int] = None,
+    threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Resolve preset defaults and explicit DBCache overrides.
+
+    ``None`` keeps the preset value.  The generic node translates its existing
+    zero-as-preset UI controls to ``None``; advanced nodes can therefore pass
+    an explicit zero when the underlying Cache-DiT option supports it.
+    """
+    return {
+        "fn_blocks": preset.fn_blocks if fn_blocks is None else fn_blocks,
+        "bn_blocks": preset.bn_blocks if bn_blocks is None else bn_blocks,
+        "threshold": preset.threshold if threshold is None else threshold,
+        "max_warmup_steps": (
+            preset.max_warmup_steps if warmup_steps is None else warmup_steps
+        ),
+        "skip_interval": (
+            preset.skip_interval if skip_interval is None else skip_interval
+        ),
+    }
+
+
+def validate_block_cache_layout(
+    block_count: int,
+    fn_blocks: int,
+    bn_blocks: int,
+    threshold: float,
+) -> None:
+    """Validate an explicit F/M/B split before installing BlockAdapter."""
+    if block_count <= 0:
+        raise ValueError("block_count must be positive")
+    if fn_blocks < 1:
+        raise ValueError("fn_blocks must be at least 1")
+    if bn_blocks < 0:
+        raise ValueError("bn_blocks must be non-negative")
+    if fn_blocks + bn_blocks >= block_count:
+        raise ValueError(
+            "fn_blocks + bn_blocks must leave at least one middle cache block "
+            f"(got F{fn_blocks}B{bn_blocks} for {block_count} blocks)"
+        )
+    if threshold <= 0:
+        raise ValueError("residual_diff_threshold must be greater than 0")
+
+
 # Hardcoded presets for 2026 mainstream models
 MODEL_PRESETS: Dict[str, ModelPreset] = {
     # =========================================================================
@@ -139,6 +189,26 @@ MODEL_PRESETS: Dict[str, ModelPreset] = {
         threshold=0.12,
         max_warmup_steps=4,
         enable_separate_cfg=True,
+        cfg_compute_first=False,
+        skip_interval=0,
+        noise_scale=0.0,
+        default_strategy="adaptive",
+        taylor_order=1,
+    ),
+
+    # =========================================================================
+    # MiniMax H3 Audio-Video Series
+    # =========================================================================
+    "MiniMax-H3": ModelPreset(
+        name="MiniMax-H3",
+        description="MiniMax H3 joint audio-video diffusion transformer",
+        description_cn="MiniMax H3 音视频联合扩散模型",
+        forward_pattern="Pattern_3",
+        fn_blocks=8,
+        bn_blocks=0,
+        threshold=0.12,
+        max_warmup_steps=3,
+        enable_separate_cfg=False,
         cfg_compute_first=False,
         skip_interval=0,
         noise_scale=0.0,
@@ -478,6 +548,66 @@ def _manual_extract_blocks(transformer: torch.nn.Module) -> Optional[List[torch.
     return None
 
 
+class _CloneInputBlock(torch.nn.Module):
+    """Keep a DBCache residual boundary safe from in-place block updates."""
+
+    def __init__(self, block: torch.nn.Module):
+        super().__init__()
+        self.block = block
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        return self.block(hidden_states.clone(), *args, **kwargs)
+
+
+def prepare_block_adapter_blocks(
+    transformer: torch.nn.Module,
+    manual_blocks: List[torch.nn.Module],
+    clone_input_indices: Optional[List[int]] = None,
+) -> Tuple[torch.nn.ModuleList, str]:
+    """Resolve the real block attribute and optionally clone selected inputs.
+
+    ``BlockAdapter`` needs both the owning transformer and the attribute name
+    that the transformer's forward actually reads.  A copied ``ModuleList``
+    cannot be auto-matched back to that attribute.  MiniMax H3 additionally
+    mutates its hidden states in place, so its first Fn and Mn blocks are
+    wrapped to snapshot only the two residual boundaries used by DBCache.
+    """
+    manual_ids = [id(block) for block in manual_blocks]
+    candidates = []
+    for attr_name in ("blocks", "transformer_blocks", "dit_blocks", "layers"):
+        if hasattr(transformer, attr_name):
+            candidates.append((attr_name, getattr(transformer, attr_name)))
+    candidates.extend(transformer.named_children())
+
+    blocks_name = None
+    source_blocks = None
+    seen_names = set()
+    for attr_name, container in candidates:
+        if attr_name in seen_names:
+            continue
+        seen_names.add(attr_name)
+        if not isinstance(container, (list, torch.nn.ModuleList, torch.nn.Sequential)):
+            continue
+        children = list(container.children()) if isinstance(container, torch.nn.Sequential) else list(container)
+        if [id(block) for block in children] == manual_ids:
+            blocks_name = attr_name
+            source_blocks = children
+            break
+
+    if blocks_name is None or source_blocks is None:
+        raise RuntimeError(
+            "Unable to resolve the extracted blocks to a transformer attribute; "
+            "BlockAdapter requires an explicit blocks_name"
+        )
+
+    adapter_blocks = torch.nn.ModuleList(source_blocks)
+    for index in sorted(set(clone_input_indices or [])):
+        if 0 <= index < len(adapter_blocks):
+            adapter_blocks[index] = _CloneInputBlock(adapter_blocks[index])
+
+    return adapter_blocks, blocks_name
+
+
 def build_block_adapter(
     transformer: torch.nn.Module,
     forward_pattern: str,
@@ -623,6 +753,7 @@ def format_summary_dashboard(
     
     quality_metrics = [
         ("Threshold", f"{config_info.get('threshold', 0):.4f}"),
+        ("Warmup Steps", f"{config_info.get('warmup_steps', 0)}"),
         ("Avg Residual Diff", f"{avg_diff:.6f}"),
         ("Max Residual Diff", f"{max_diff:.6f}"),
         ("Fn/Bn Blocks", f"F{config_info.get('fn', 0)}B{config_info.get('bn', 0)}"),
@@ -680,7 +811,10 @@ def format_summary_dashboard(
     return "\n".join(lines)
 
 
-def get_summary_stats(transformer: torch.nn.Module) -> Dict[str, Any]:
+def get_summary_stats(
+    transformer: torch.nn.Module,
+    num_steps: int = 0,
+) -> Dict[str, Any]:
     """
     Get summary statistics from cache-dit.
     
@@ -696,22 +830,56 @@ def get_summary_stats(transformer: torch.nn.Module) -> Dict[str, Any]:
             logger.warning("[CacheDiT] cache_dit.summary() returned None - cache may not be active")
             return {}
         
-        # Normalize stats to consistent format
+        # cache-dit returns list[CacheStats] for transformer adapters.  Older
+        # plugin code treated the list itself as CacheStats and displayed all
+        # zeroes even though the core summary reported cache hits.
+        stats_items = stats if isinstance(stats, (list, tuple)) else [stats]
+        candidates = []
+        for item in stats_items:
+            cached_value = getattr(item, "accumulated_cached_steps", None)
+            cached_list = getattr(item, "cached_steps", [])
+            if cached_value is None:
+                cached_value = len(cached_list) if isinstance(cached_list, (list, tuple)) else cached_list
+
+            total_value = getattr(item, "accumulated_executed_steps", None)
+            if total_value is None:
+                total_value = getattr(item, "total_steps", 0)
+
+            diff_values = []
+            for value in getattr(item, "residual_diffs", {}).values():
+                values = value if isinstance(value, (list, tuple)) else [value]
+                for diff in values:
+                    try:
+                        diff = float(diff)
+                    except (TypeError, ValueError):
+                        continue
+                    if torch.isfinite(torch.tensor(diff)).item():
+                        diff_values.append(diff)
+
+            if total_value or cached_value or diff_values:
+                candidates.append((item, int(total_value or 0), int(cached_value or 0), diff_values))
+
+        if not candidates:
+            logger.warning("[CacheDiT] cache_dit.summary() contained no execution statistics")
+            return {}
+
+        item, total_steps, cached_steps, diff_values = max(
+            candidates,
+            key=lambda candidate: (candidate[1], candidate[2], len(candidate[3])),
+        )
+        if total_steps <= 0:
+            total_steps = num_steps
+        computed_steps = max(total_steps - cached_steps, 0)
+
         result = {
-            "total_steps": getattr(stats, "total_steps", 0),
-            "cached_steps": getattr(stats, "cached_steps", 0),
-            "computed_steps": getattr(stats, "computed_steps", 0),
-            "avg_residual_diff": getattr(stats, "avg_diff", 0.0),
-            "max_residual_diff": getattr(stats, "max_diff", 0.0),
-            "speedup": getattr(stats, "speedup", 1.0),
+            "total_steps": total_steps,
+            "cached_steps": cached_steps,
+            "computed_steps": computed_steps,
+            "avg_residual_diff": sum(diff_values) / len(diff_values) if diff_values else 0.0,
+            "max_residual_diff": max(diff_values) if diff_values else 0.0,
+            "speedup": total_steps / computed_steps if computed_steps > 0 else 1.0,
             "raw": stats,
         }
-        
-        # Calculate speedup if not provided
-        if result["speedup"] == 1.0 and result["total_steps"] > 0:
-            computed = result["computed_steps"] or (result["total_steps"] - result["cached_steps"])
-            if computed > 0:
-                result["speedup"] = result["total_steps"] / computed
         
         # Debug log if no caching occurred
         if result["total_steps"] > 0 and result["cached_steps"] == 0:
@@ -739,7 +907,7 @@ def print_summary_to_log(
     Get summary, format as dashboard, and print to log.
     Returns the formatted string.
     """
-    stats = get_summary_stats(transformer)
+    stats = get_summary_stats(transformer, num_steps=num_steps)
     dashboard = format_summary_dashboard(stats, model_type, num_steps, config_info)
     
     # Print to log
