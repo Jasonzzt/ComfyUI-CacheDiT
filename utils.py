@@ -68,6 +68,56 @@ class ModelPreset:
         }
 
 
+def resolve_cache_parameters(
+    preset: ModelPreset,
+    *,
+    warmup_steps: Optional[int] = None,
+    skip_interval: Optional[int] = None,
+    fn_blocks: Optional[int] = None,
+    bn_blocks: Optional[int] = None,
+    threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Resolve preset defaults and explicit DBCache overrides.
+
+    ``None`` keeps the preset value.  The generic node translates its existing
+    zero-as-preset UI controls to ``None``; advanced nodes can therefore pass
+    an explicit zero when the underlying Cache-DiT option supports it.
+    """
+    return {
+        "fn_blocks": preset.fn_blocks if fn_blocks is None else fn_blocks,
+        "bn_blocks": preset.bn_blocks if bn_blocks is None else bn_blocks,
+        "threshold": preset.threshold if threshold is None else threshold,
+        "max_warmup_steps": (
+            preset.max_warmup_steps if warmup_steps is None else warmup_steps
+        ),
+        "skip_interval": (
+            preset.skip_interval if skip_interval is None else skip_interval
+        ),
+    }
+
+
+def validate_block_cache_layout(
+    block_count: int,
+    fn_blocks: int,
+    bn_blocks: int,
+    threshold: float,
+) -> None:
+    """Validate an explicit F/M/B split before installing BlockAdapter."""
+    if block_count <= 0:
+        raise ValueError("block_count must be positive")
+    if fn_blocks < 1:
+        raise ValueError("fn_blocks must be at least 1")
+    if bn_blocks < 0:
+        raise ValueError("bn_blocks must be non-negative")
+    if fn_blocks + bn_blocks >= block_count:
+        raise ValueError(
+            "fn_blocks + bn_blocks must leave at least one middle cache block "
+            f"(got F{fn_blocks}B{bn_blocks} for {block_count} blocks)"
+        )
+    if threshold <= 0:
+        raise ValueError("residual_diff_threshold must be greater than 0")
+
+
 # Hardcoded presets for 2026 mainstream models
 MODEL_PRESETS: Dict[str, ModelPreset] = {
     # =========================================================================
@@ -703,6 +753,7 @@ def format_summary_dashboard(
     
     quality_metrics = [
         ("Threshold", f"{config_info.get('threshold', 0):.4f}"),
+        ("Warmup Steps", f"{config_info.get('warmup_steps', 0)}"),
         ("Avg Residual Diff", f"{avg_diff:.6f}"),
         ("Max Residual Diff", f"{max_diff:.6f}"),
         ("Fn/Bn Blocks", f"F{config_info.get('fn', 0)}B{config_info.get('bn', 0)}"),

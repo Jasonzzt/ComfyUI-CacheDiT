@@ -31,6 +31,9 @@ from .utils import (
     build_calibrator_config,
     print_summary_to_log,
     apply_noise_injection,
+    resolve_cache_parameters,
+    validate_block_cache_layout,
+    _manual_extract_blocks,
 )
 
 
@@ -425,6 +428,7 @@ class CacheDiTConfig:
             "fn": self.fn_blocks,
             "bn": self.bn_blocks,
             "threshold": self.threshold,
+            "warmup_steps": self.max_warmup_steps,
             "skip_interval": self.skip_interval,
             "noise_scale": self.noise_scale,
             "taylor_order": self.taylor_order,
@@ -848,6 +852,27 @@ def _refresh_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
 # Main Node: CacheDiT_Model_Optimizer
 # =============================================================================
 
+def _resolve_model_type(model, requested_model_type: str) -> str:
+    """Resolve the generic Auto choice without mutating the model."""
+    if requested_model_type != "Auto":
+        return requested_model_type
+    if not hasattr(model.model, "diffusion_model"):
+        logger.info("[CacheDiT] Cannot auto-detect model type, using Custom preset")
+        return "Custom"
+
+    class_name = model.model.diffusion_model.__class__.__name__
+    if "Qwen" in class_name:
+        return "Qwen-Image"
+    if "NextDiT" in class_name:
+        return "Z-Image"
+    if any(name in class_name for name in ("Flux", "FLUX", "Flux2", "FLUX2")):
+        return "Flux"
+    if "MiniMaxH3" in class_name:
+        return "MiniMax-H3"
+
+    logger.info(f"[CacheDiT] Auto-detected unknown model: {class_name}, using Custom preset")
+    return "Custom"
+
 class CacheDiT_Model_Optimizer:
     """
     CacheDiT Model Optimizer for ComfyUI
@@ -855,7 +880,7 @@ class CacheDiT_Model_Optimizer:
     Accelerates DiT model inference through inter-step residual caching.
     Automatically detects inference steps and refreshes context.
     
-    Supports: Qwen-Image, Z-Image.
+    Supports: Qwen-Image, Z-Image, Flux, and MiniMax H3.
     """
     
     @classmethod
@@ -902,8 +927,8 @@ class CacheDiT_Model_Optimizer:
     FUNCTION = "optimize"
     CATEGORY = "⚡ CacheDiT"
     DESCRIPTION = (
-        "Accelerate DiT models (Qwen-Image, Z-Image, etc.) via caching.\n"
-        "通过缓存加速 DiT 模型 (Qwen-Image、Z-Image 等)"
+        "Accelerate DiT models (Qwen-Image, Z-Image, Flux, MiniMax H3, etc.) via caching.\n"
+        "通过缓存加速 DiT 模型 (Qwen-Image、Z-Image、Flux、MiniMax H3 等)"
     )
     
     def optimize(
@@ -914,6 +939,11 @@ class CacheDiT_Model_Optimizer:
         warmup_steps: int = 0,
         skip_interval: int = 0,
         print_summary: bool = True,
+        *,
+        fn_blocks_override: Optional[int] = None,
+        bn_blocks_override: Optional[int] = None,
+        threshold_override: Optional[float] = None,
+        warmup_steps_override: Optional[int] = None,
     ):
         """Apply CacheDiT optimization to the model."""
         # If disabled, return model as-is
@@ -932,44 +962,50 @@ class CacheDiT_Model_Optimizer:
         else:
             logger.info(f"[CacheDiT] No transformer found")
         
+        resolved_model_type = _resolve_model_type(model, model_type)
+        preset = get_preset(resolved_model_type)
+        effective = resolve_cache_parameters(
+            preset,
+            warmup_steps=(
+                warmup_steps_override
+                if warmup_steps_override is not None
+                else (None if warmup_steps == 0 else warmup_steps)
+            ),
+            skip_interval=None if skip_interval == 0 else skip_interval,
+            fn_blocks=fn_blocks_override,
+            bn_blocks=bn_blocks_override,
+            threshold=threshold_override,
+        )
+        expected_config = {
+            "model_type": resolved_model_type,
+            "fn_blocks": effective["fn_blocks"],
+            "bn_blocks": effective["bn_blocks"],
+            "threshold": effective["threshold"],
+            "warmup_steps": effective["max_warmup_steps"],
+            "skip_interval": effective["skip_interval"],
+            "print_summary": print_summary,
+        }
+
         if existing_config is not None:
-            # Need to resolve "Auto" before comparison
-            resolved_model_type = model_type
-            logger.info(f"[CacheDiT] Existing configuration detected: model_type={existing_config['model_type']}, "
-                  f"warmup_steps={existing_config['warmup_steps']}, "
-                  f"skip_interval={existing_config['skip_interval']}, "
-                  f"print_summary={existing_config['print_summary']}")
-            if model_type == "Auto":
-                if hasattr(model.model, 'diffusion_model'):
-                    transformer = model.model.diffusion_model
-                    class_name = transformer.__class__.__name__
-                    if "Qwen" in class_name:
-                        resolved_model_type = "Qwen-Image"
-                    elif "NextDiT" in class_name:
-                        resolved_model_type = "Z-Image"
-                    elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
-                        resolved_model_type = "Flux"
-                    elif "MiniMaxH3" in class_name:
-                        resolved_model_type = "MiniMax-H3"
-                    else:
-                        resolved_model_type = "Custom"
-                else:
-                    resolved_model_type = "Custom"
-            
-            # Compare key parameters
-            params_changed = (
-                existing_config["model_type"] != resolved_model_type or
-                existing_config["warmup_steps"] != warmup_steps or
-                existing_config["skip_interval"] != skip_interval or
-                existing_config["print_summary"] != print_summary
+            logger.info(f"[CacheDiT] Existing configuration detected: model_type={existing_config.get('model_type')}, "
+                  f"warmup_steps={existing_config.get('warmup_steps')}, "
+                  f"skip_interval={existing_config.get('skip_interval')}, "
+                  f"print_summary={existing_config.get('print_summary')}")
+            params_changed = any(
+                existing_config.get(key) != value
+                for key, value in expected_config.items()
             )
             
             if params_changed:
                 logger.info(
                     f"[CacheDiT] Parameters changed, reconfiguring... "
-                    f"(model: {existing_config['model_type']}→{resolved_model_type}, "
-                    f"warmup: {existing_config['warmup_steps']}→{warmup_steps}, "
-                    f"skip: {existing_config['skip_interval']}→{skip_interval})"
+                    f"(model: {existing_config.get('model_type')}→{resolved_model_type}, "
+                    f"F/B: F{existing_config.get('fn_blocks')}B{existing_config.get('bn_blocks')}"
+                    f"→F{effective['fn_blocks']}B{effective['bn_blocks']}, "
+                    f"threshold: {existing_config.get('threshold')}→{effective['threshold']}, "
+                    f"warmup: {existing_config.get('warmup_steps')}"
+                    f"→{effective['max_warmup_steps']}, "
+                    f"skip: {existing_config.get('skip_interval')}→{effective['skip_interval']})"
                 )
                 # Disable old configuration first (disable already clones internally)
                 result = self.disable(model)
@@ -981,44 +1017,18 @@ class CacheDiT_Model_Optimizer:
             # First-time configuration: need to clone
             model = model.clone()
         
-        # Auto-detect model type if "Auto" is selected
-        if model_type == "Auto":
-            # Try to detect from model architecture
-            if hasattr(model.model, 'diffusion_model'):
-                transformer = model.model.diffusion_model
-                class_name = transformer.__class__.__name__
-                
-                # Map common class names to presets
-                if "Qwen" in class_name:
-                    model_type = "Qwen-Image"
-                elif "NextDiT" in class_name:
-                    model_type = "Z-Image"
-                elif "Flux" in class_name or "FLUX" in class_name or "Flux2" in class_name or "FLUX2" in class_name:
-                    model_type = "Flux"
-                elif "MiniMaxH3" in class_name:
-                    model_type = "MiniMax-H3"
-                else:
-                    model_type = "Custom"
-                    logger.info(f"[CacheDiT] Auto-detected unknown model: {class_name}, using Custom preset")
-            else:
-                model_type = "Custom"
-                logger.info("[CacheDiT] Cannot auto-detect model type, using Custom preset")
-        
-        # Get preset
-        preset = get_preset(model_type)
-        
         # Use all preset defaults
         config = CacheDiTConfig(
-            model_type=model_type,
+            model_type=resolved_model_type,
             forward_pattern=preset.forward_pattern,
             strategy=preset.default_strategy,
-            fn_blocks=preset.fn_blocks,
-            bn_blocks=preset.bn_blocks,
-            threshold=preset.threshold,
-            max_warmup_steps=3,
+            fn_blocks=effective["fn_blocks"],
+            bn_blocks=effective["bn_blocks"],
+            threshold=effective["threshold"],
+            max_warmup_steps=effective["max_warmup_steps"],
             enable_separate_cfg=preset.enable_separate_cfg,
             cfg_compute_first=preset.cfg_compute_first,
-            skip_interval=0,
+            skip_interval=effective["skip_interval"],
             noise_scale=preset.noise_scale,
             taylor_order=1,
             scm_policy="none",
@@ -1037,15 +1047,20 @@ class CacheDiT_Model_Optimizer:
         # Also store simplified config dict on transformer for persistence
         if hasattr(model.model, 'diffusion_model'):
             transformer = model.model.diffusion_model
-            transformer._cache_dit_config = {
-                "model_type": config.model_type,
-                "warmup_steps": config.user_warmup_steps,
-                "skip_interval": config.user_skip_interval,
-                "print_summary": config.print_summary,
-            }
-            logger.info(f"[CacheDiT] Config stored on transformer: {config.model_type}, warmup={config.user_warmup_steps}, skip={config.user_skip_interval}")
+            transformer._cache_dit_config = expected_config.copy()
+            logger.info(
+                f"[CacheDiT] Config stored on transformer: {config.model_type}, "
+                f"F{config.fn_blocks}B{config.bn_blocks}, "
+                f"threshold={config.threshold}, warmup={config.max_warmup_steps}, "
+                f"skip={config.skip_interval}"
+            )
         else:
-            logger.info(f"[CacheDiT] Config stored: {config.model_type}, warmup={config.user_warmup_steps}, skip={config.user_skip_interval}")
+            logger.info(
+                f"[CacheDiT] Config stored: {config.model_type}, "
+                f"F{config.fn_blocks}B{config.bn_blocks}, "
+                f"threshold={config.threshold}, warmup={config.max_warmup_steps}, "
+                f"skip={config.skip_interval}"
+            )
         
         # Add wrappers
         model.add_wrapper_with_key(
@@ -1088,6 +1103,9 @@ class CacheDiT_Model_Optimizer:
                     cache_dit.disable_cache(transformer)
                 except:
                     pass
+
+                if hasattr(transformer, "_cache_dit_config"):
+                    delattr(transformer, "_cache_dit_config")
                 
                 # Reset lightweight cache state
                 global _lightweight_cache_state
@@ -1106,14 +1124,123 @@ class CacheDiT_Model_Optimizer:
         
         return (model,)
 
+
+class CacheDiT_MiniMax_H3_Advanced_Optimizer:
+    """Explicit H3 DBCache controls backed by the generic optimizer runtime."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enable": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable/Disable MiniMax H3 CacheDiT acceleration",
+                }),
+                "fn_blocks": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 49,
+                    "step": 1,
+                    "tooltip": "Always compute the first N H3 transformer blocks",
+                }),
+                "bn_blocks": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 49,
+                    "step": 1,
+                    "tooltip": "Recompute the last N H3 transformer blocks on cache hits",
+                }),
+                "residual_diff_threshold": ("FLOAT", {
+                    "default": 0.12,
+                    "min": 0.001,
+                    "max": 1.0,
+                    "step": 0.001,
+                    "round": 0.001,
+                    "tooltip": "Higher values allow more cache hits but may reduce fidelity",
+                }),
+                "warmup_steps": ("INT", {
+                    "default": 3,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Exact number of initial full-compute diffusion steps (0 disables warmup)",
+                }),
+                "print_summary": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Print the effective H3 DBCache configuration and statistics",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("optimized_model",)
+    FUNCTION = "optimize"
+    CATEGORY = "⚡ CacheDiT"
+    DESCRIPTION = (
+        "Advanced MiniMax H3 DBCache controls. The generic CacheDiT Accelerator "
+        "with Auto detection remains the recommended default."
+    )
+
+    def optimize(
+        self,
+        model,
+        enable: bool = True,
+        fn_blocks: int = 8,
+        bn_blocks: int = 0,
+        residual_diff_threshold: float = 0.12,
+        warmup_steps: int = 3,
+        print_summary: bool = True,
+    ):
+        optimizer = CacheDiT_Model_Optimizer()
+        if not enable:
+            return optimizer.disable(model)
+
+        if not hasattr(model.model, "diffusion_model"):
+            raise ValueError("MiniMax H3 Advanced requires a diffusion model")
+        transformer = model.model.diffusion_model
+        class_name = transformer.__class__.__name__
+        if "MiniMaxH3" not in class_name:
+            raise ValueError(
+                "MiniMax H3 Advanced only accepts MiniMaxH3Model "
+                f"(detected {class_name})"
+            )
+
+        blocks = _manual_extract_blocks(transformer)
+        block_count = len(blocks) if blocks is not None else 0
+        validate_block_cache_layout(
+            block_count,
+            fn_blocks,
+            bn_blocks,
+            residual_diff_threshold,
+        )
+
+        return optimizer.optimize(
+            model,
+            enable=True,
+            model_type="MiniMax-H3",
+            warmup_steps=warmup_steps,
+            skip_interval=0,
+            print_summary=print_summary,
+            fn_blocks_override=fn_blocks,
+            bn_blocks_override=bn_blocks,
+            threshold_override=residual_diff_threshold,
+            warmup_steps_override=warmup_steps,
+        )
+
+    def disable(self, model):
+        return CacheDiT_Model_Optimizer().disable(model)
+
 # =============================================================================
 # Node Registration
 # =============================================================================
 
 NODE_CLASS_MAPPINGS = {
     "CacheDiT_Model_Optimizer": CacheDiT_Model_Optimizer,
+    "CacheDiT_MiniMax_H3_Advanced_Optimizer": CacheDiT_MiniMax_H3_Advanced_Optimizer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CacheDiT_Model_Optimizer": "⚡ CacheDiT Accelerator",
+    "CacheDiT_MiniMax_H3_Advanced_Optimizer": "⚡ CacheDiT MiniMax H3 Advanced",
 }
