@@ -46,13 +46,16 @@ Inspired by [**llm-scaler**](https://github.com/intel/llm-scaler), a high-perfor
 | **Qwen-Image-2512** | 50 | 1.4-1.6x | 5 | 3 |
 | **Flux.2 Klein 4B** | 20 | 1.67x | 4 | 2 |
 | **Flux.2 Klein 9B** | 20 | 1.67x | 4 | 2 |
-| **MiniMax H3** | 20 | Integration validated | 3 | Adaptive DBCache |
+| **MiniMax H3** | 20 | 1.41-1.50x | 3 | N/A (adaptive) |
 | **LTX-2 T2V** | 20 | 2.0x | 6 | 4 |
 | **LTX-2 I2V** | 20 | 2.0x | 6 | 4 |
 | **WAN2.2 14B T2V** | 20 | 1.67x | 4 | 2 |
 | **WAN2.2 14B I2V** | 20 | 1.67x | 4 | 2 |
 
 </div>
+
+MiniMax H3 uses residual-difference-based adaptive DBCache decisions rather
+than a fixed `skip_interval`, so that column is not applicable to H3.
 
 ## Installation
 
