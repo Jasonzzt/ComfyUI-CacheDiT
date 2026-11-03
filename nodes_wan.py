@@ -21,6 +21,7 @@ import torch
 import comfy.model_patcher
 import comfy.patcher_extension
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from .utils import detach_output
 
 if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
@@ -93,7 +94,9 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
     """Enable lightweight cache for Wan2.2 transformer"""
     transformer_id = id(transformer)
     state = _get_or_create_cache_state(transformer_id)
+    # Ensure previous wrapper is safely unwrapped to avoid recursion
     if hasattr(transformer, '_original_forward_wan'):
+        transformer.forward = transformer._original_forward_wan
         if state.get("transformer_id") == transformer_id:
             logger.info("[Wan-Cache] Already enabled, resetting state")
             state.update({
@@ -105,8 +108,11 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
             })
             return
     
-    # Save original forward
-    transformer._original_forward_wan = transformer.forward
+    # Save original forward (guard against double wrapping)
+    orig_forward = transformer.forward
+    if getattr(orig_forward, '__name__', None) == 'cached_forward' and hasattr(transformer, '_original_forward_wan'):
+        orig_forward = transformer._original_forward_wan
+    transformer._original_forward_wan = orig_forward
     
     # Initialize state
     state.update({
@@ -146,16 +152,7 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
             state["compute_times"].append(elapsed)
             
             # Cache result - CRITICAL: use detach() only, NO clone()
-            if isinstance(result, torch.Tensor):
-                state["last_result"] = result.detach()
-            elif isinstance(result, tuple):
-                # Handle tuple of tensors (Wan model may return tuples)
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result
+            state["last_result"] = detach_output(result)
             
             if call_id <= 3 and cache_config and cache_config.verbose:
                 logger.info(f"[Wan-Cache] Warmup step {call_id}/{warmup_steps}, cached result")
@@ -192,15 +189,7 @@ def _enable_wan_cache(transformer, config: WanCacheConfig):
             state["compute_times"].append(elapsed)
             
             # Update cache - CRITICAL: use detach() only
-            if isinstance(result, torch.Tensor):
-                state["last_result"] = result.detach()
-            elif isinstance(result, tuple):
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result
+            state["last_result"] = detach_output(result)
             
             if call_id <= 10 and cache_config and cache_config.verbose:
                 logger.info(
@@ -380,7 +369,18 @@ def _wan_outer_sample_wrapper(executor, *args, **kwargs):
     
     finally:
         # Restore original model options
-        guider.model_options = orig_model_options
+        try:
+            guider.model_options = orig_model_options
+        except:
+            pass
+        # CRITICAL: Clean up monkey-patched forward on transformer to prevent memory leak and recursion
+        if transformer is not None and hasattr(transformer, '_original_forward_wan'):
+            try:
+                transformer.forward = transformer._original_forward_wan
+                delattr(transformer, '_original_forward_wan')
+                logger.info(f"[Wan-Cache] Cleaned up transformer {id(transformer)} on sampling exit")
+            except Exception as e:
+                logger.warning(f"[Wan-Cache] Cleanup on sampling exit failed: {e}")
 
 
 # =============================================================================
@@ -540,7 +540,9 @@ class WanCacheOptimizer:
             del model.model_options["transformer_options"]["wan_cache"]
         
         # Remove wrapper
-        if "wan_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
+        if hasattr(model, "remove_wrappers_with_key"):
+            model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "wan_cache")
+        elif "wan_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
             del model.wrappers[comfy.patcher_extension.WrappersMP.OUTER_SAMPLE]["wan_cache"]
         
         # Restore original forward and clear cache state

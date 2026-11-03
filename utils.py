@@ -918,21 +918,42 @@ def print_summary_to_log(
 
 
 # =============================================================================
-# Noise Injection Utility
+# Cache Detach & Noise Injection Utilities
 # =============================================================================
 
+def detach_output(output: Any) -> Any:
+    """Detach tensors in output (Tensor, tuple, or list) to prevent computational graph retention."""
+    if isinstance(output, torch.Tensor):
+        return output.detach()
+    elif isinstance(output, tuple):
+        return tuple(detach_output(x) for x in output)
+    elif isinstance(output, list):
+        return [detach_output(x) for x in output]
+    return output
+
+
 def apply_noise_injection(
-    output: torch.Tensor,
+    output: Union[torch.Tensor, Tuple[Any, ...], List[Any]],
     noise_scale: float,
     generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[Any, ...], List[Any]]:
     """
     Apply small noise perturbation to cached output.
     
     Prevents "static" or "dead" regions in generated content.
+    Supports single Tensor, tuple of Tensors, or list of Tensors.
     Typical scale: 0.001 - 0.003
     """
     if noise_scale <= 0:
+        return output
+    
+    if isinstance(output, tuple):
+        return tuple(apply_noise_injection(x, noise_scale, generator=generator) for x in output)
+    if isinstance(output, list):
+        return [apply_noise_injection(x, noise_scale, generator=generator) for x in output]
+    if not isinstance(output, torch.Tensor):
+        return output
+    if not output.is_floating_point():
         return output
     
     # Handle generator compatibility (added in PyTorch 1.11.0)
