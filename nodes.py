@@ -31,6 +31,7 @@ from .utils import (
     build_calibrator_config,
     print_summary_to_log,
     apply_noise_injection,
+    detach_output,
     resolve_cache_parameters,
     validate_block_cache_layout,
     _manual_extract_blocks,
@@ -58,7 +59,7 @@ _lightweight_cache_state = {
 
 
 def _cleanup_transformer_cache(transformer):
-    """Remove all cache-related attributes from transformer"""
+    """Remove all cache-related attributes from transformer and restore forward"""
     if hasattr(transformer, '_original_forward'):
         try:
             transformer.forward = transformer._original_forward
@@ -66,6 +67,11 @@ def _cleanup_transformer_cache(transformer):
             logger.info(f"[Lightweight-Cache] Cleaned up transformer {id(transformer)}")
         except Exception as e:
             logger.warning(f"[Lightweight-Cache] Cleanup failed: {e}")
+    try:
+        import cache_dit
+        cache_dit.disable_cache(transformer)
+    except Exception:
+        pass
 
 
 
@@ -95,8 +101,11 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
     # This ensures we start completely fresh every time
     _cleanup_transformer_cache(transformer)
     
-    # Store original forward (now guaranteed to be the real original)
-    transformer._original_forward = transformer.forward
+    # Store original forward (guard against double wrapping)
+    orig_forward = transformer.forward
+    if getattr(orig_forward, '__name__', None) == 'cached_forward' and hasattr(transformer, '_original_forward'):
+        orig_forward = transformer._original_forward
+    transformer._original_forward = orig_forward
     logger.info(f"[Lightweight-Cache] Saved original forward for transformer {current_id}")
     
     # ALWAYS completely reset global state
@@ -229,16 +238,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             state["compute_count"] += 1
             state["compute_times"].append(elapsed)
             
-            if isinstance(result, torch.Tensor):
-                state["last_result"] = result.detach()
-            elif isinstance(result, tuple):
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result
-            
+            state["last_result"] = detach_output(result)
             return result
         
         steps_after_warmup = call_id - warmup_steps
@@ -250,15 +250,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             cached_result = state["last_result"]
             
             if noise_scale > 0:
-                if isinstance(cached_result, torch.Tensor):
-                    noise = torch.randn_like(cached_result) * noise_scale
-                    cached_result = cached_result + noise
-                elif isinstance(cached_result, tuple):
-                    # Apply noise to tensor elements in tuple
-                    cached_result = tuple(
-                        (r + torch.randn_like(r) * noise_scale) if isinstance(r, torch.Tensor) else r
-                        for r in cached_result
-                    )
+                cached_result = apply_noise_injection(cached_result, noise_scale)
             
             return cached_result
         else:
@@ -270,16 +262,7 @@ def _enable_lightweight_cache(transformer, blocks, config, cache_config):
             state["compute_count"] += 1
             state["compute_times"].append(elapsed)
             
-            if isinstance(result, torch.Tensor):
-                state["last_result"] = result.detach()
-            elif isinstance(result, tuple):
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result
-            
+            state["last_result"] = detach_output(result)
             return result
     
     # Replace forward method
@@ -569,6 +552,12 @@ def _cache_dit_outer_sample_wrapper(executor, *args, **kwargs):
             guider.model_options = orig_model_options
         except:
             pass
+        # CRITICAL: Clean up monkey-patched forward on transformer to prevent memory leak and recursion
+        if transformer is not None:
+            try:
+                _cleanup_transformer_cache(transformer)
+            except Exception as e:
+                logger.warning(f"[CacheDiT] Cleanup on sampling exit failed: {e}")
 
 
 def _cache_dit_diffusion_model_wrapper(executor, *args, **kwargs):
@@ -579,8 +568,15 @@ def _cache_dit_diffusion_model_wrapper(executor, *args, **kwargs):
     - Applies noise injection on cached outputs (if enabled)
     """
     try:
-        # Get transformer_options
-        transformer_options = args[-1] if isinstance(args[-1], dict) else kwargs.get("transformer_options", {})
+        # Get transformer_options robustly across models
+        transformer_options = kwargs.get("transformer_options")
+        if transformer_options is None:
+            for arg in reversed(args):
+                if isinstance(arg, dict) and ("transformer_options" in arg or "cache_dit_turbo" in arg):
+                    transformer_options = arg.get("transformer_options", arg)
+                    break
+        if not isinstance(transformer_options, dict):
+            transformer_options = {}
         config: CacheDiTConfig = transformer_options.get("cache_dit_turbo")
         
         if config is not None:
@@ -631,38 +627,6 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
     Enable cache-dit on transformer using BlockAdapter interface.
     """
     try:
-        import cache_dit
-        from cache_dit import BlockAdapter
-        
-        # For ComfyUI models, manually extract blocks
-        from .utils import _manual_extract_blocks, prepare_block_adapter_blocks
-        
-        manual_blocks = _manual_extract_blocks(transformer)
-        if not manual_blocks or len(manual_blocks) == 0:
-            raise RuntimeError("Failed to extract blocks from transformer")
-        
-        logger.info(f"[CacheDiT] Extracted {len(manual_blocks)} blocks for caching")
-        
-        # Build cache config
-        cache_config = build_cache_config(
-            num_inference_steps=config.num_inference_steps,
-            fn_blocks=config.fn_blocks,
-            bn_blocks=config.bn_blocks,
-            threshold=config.threshold,
-            max_warmup_steps=config.max_warmup_steps,
-            enable_separate_cfg=config.enable_separate_cfg,
-            cfg_compute_first=config.cfg_compute_first,
-            skip_interval=config.skip_interval,
-            strategy=config.strategy,
-            scm_policy=config.scm_policy if config.scm_policy != "none" else None,
-        )
-        
-        # Build calibrator config
-        calibrator_config = build_calibrator_config(config.taylor_order)
-        
-        # Get forward pattern
-        pattern = get_forward_pattern(config.forward_pattern)
-        
         # === Check if lightweight cache should be used directly ===
         transformer_class_name = transformer.__class__.__name__
         transformer_module = transformer.__class__.__module__
@@ -682,13 +646,39 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
                     detected_name = "Flux2"
         
         print(f"[CacheDiT] Transformer class: {detected_name} (module: {transformer_module})")
-        # ComfyUI models typically don't work well with cache-dit BlockAdapter
-        # Use lightweight cache directly for better compatibility
-        use_lightweight = transformer_class_name in [
-            "NextDiT",        # Z-Image
-            "QwenImage",      # Qwen-Image
-            "Flux",           # Flux.1 and Flux.2
-        ]
+        # Modern ComfyUI models typically use lightweight cache for seamless native compatibility
+        use_lightweight = (
+            any(k in transformer_class_name for k in ("NextDiT", "Qwen", "Flux", "FLUX"))
+            or any(k in transformer_module.lower() for k in ("flux", "qwen", "nextdit"))
+            or config.model_type in ("Flux", "Flux2", "Flux3", "Qwen-Image", "Z-Image")
+        )
+        
+        # For ComfyUI models, manually extract blocks if available
+        from .utils import _manual_extract_blocks, prepare_block_adapter_blocks
+        
+        manual_blocks = None
+        try:
+            manual_blocks = _manual_extract_blocks(transformer)
+        except Exception as e:
+            logger.debug(f"[CacheDiT] Block extraction note: {e}")
+        
+        # Build cache config
+        cache_config = None
+        try:
+            cache_config = build_cache_config(
+                num_inference_steps=config.num_inference_steps,
+                fn_blocks=config.fn_blocks,
+                bn_blocks=config.bn_blocks,
+                threshold=config.threshold,
+                max_warmup_steps=config.max_warmup_steps,
+                enable_separate_cfg=config.enable_separate_cfg,
+                cfg_compute_first=config.cfg_compute_first,
+                skip_interval=config.skip_interval,
+                strategy=config.strategy,
+                scm_policy=config.scm_policy if config.scm_policy != "none" else None,
+            )
+        except Exception as e:
+            logger.debug(f"[CacheDiT] Cache config creation note: {e}")
         
         if use_lightweight:
             logger.info(f"[CacheDiT] Using lightweight cache for {detected_name}")
@@ -700,9 +690,22 @@ def _enable_cache_dit(transformer: torch.nn.Module, config: CacheDiTConfig):
             )
             return
         
+        if not manual_blocks or len(manual_blocks) == 0:
+            raise RuntimeError("Failed to extract blocks from transformer")
+        
+        logger.info(f"[CacheDiT] Extracted {len(manual_blocks)} blocks for caching")
+        
+        # Build calibrator config
+        calibrator_config = build_calibrator_config(config.taylor_order)
+        
+        # Get forward pattern
+        pattern = get_forward_pattern(config.forward_pattern)
+        
         # === Attempt to use cache-dit's BlockAdapter ===
         cache_dit_failed = False
         try:
+            import cache_dit
+            from cache_dit import BlockAdapter
             clone_input_indices = []
             if config.model_type == "MiniMax-H3":
                 # MiniMax H3 DiT blocks update x in place.  DBCache keeps
@@ -1086,7 +1089,9 @@ class CacheDiT_Model_Optimizer:
         # Remove wrappers
         for wrapper_type in [comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
                             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]:
-            if "cache_dit_turbo" in model.wrappers.get(wrapper_type, {}):
+            if hasattr(model, "remove_wrappers_with_key"):
+                model.remove_wrappers_with_key(wrapper_type, "cache_dit_turbo")
+            elif "cache_dit_turbo" in model.wrappers.get(wrapper_type, {}):
                 del model.wrappers[wrapper_type]["cache_dit_turbo"]
         
         # Restore original transformer state

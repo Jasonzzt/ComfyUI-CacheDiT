@@ -16,7 +16,8 @@ import logging
 import traceback
 import torch
 import comfy.model_patcher
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from .utils import apply_noise_injection, detach_output
 
 if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
@@ -81,6 +82,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
     """Enable lightweight cache for LTX-2 transformer (timestep-based tracking)"""
     global _ltx2_cache_state
     if hasattr(transformer, '_original_forward'):
+        transformer.forward = transformer._original_forward
         current_id = id(transformer)
         cached_id = _ltx2_cache_state.get("transformer_id")
         
@@ -95,7 +97,10 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             })
             return
     
-    transformer._original_forward = transformer.forward
+    orig_forward = transformer.forward
+    if getattr(orig_forward, '__name__', None) == 'cached_forward' and hasattr(transformer, '_original_forward'):
+        orig_forward = transformer._original_forward
+    transformer._original_forward = orig_forward
     
     _ltx2_cache_state.update({
         "enabled": True,
@@ -291,13 +296,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
                 state["compute_times"].append(elapsed)
                 
                 # Cache result
-                if isinstance(result, tuple):
-                    state["last_result"] = tuple(
-                        r.detach() if isinstance(r, torch.Tensor) else r
-                        for r in result
-                    )
-                else:
-                    state["last_result"] = result.detach() if isinstance(result, torch.Tensor) else result
+                state["last_result"] = detach_output(result)
                 
                 return result
             else:
@@ -312,15 +311,8 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
                     cached_result = state["last_result"]
                     
                     # Apply noise injection
-                    if noise_scale > 0 and isinstance(cached_result, tuple):
-                        noised = []
-                        for r in cached_result:
-                            if isinstance(r, torch.Tensor):
-                                noise = torch.randn_like(r) * noise_scale
-                                noised.append(r + noise)
-                            else:
-                                noised.append(r)
-                        cached_result = tuple(noised)
+                    if noise_scale > 0:
+                        cached_result = apply_noise_injection(cached_result, noise_scale)
                     
                     return cached_result
                 else:
@@ -334,13 +326,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
                     state["compute_times"].append(elapsed)
                     
                     # Update cache
-                    if isinstance(result, tuple):
-                        state["last_result"] = tuple(
-                            r.detach() if isinstance(r, torch.Tensor) else r
-                            for r in result
-                        )
-                    else:
-                        state["last_result"] = result.detach() if isinstance(result, torch.Tensor) else result
+                    state["last_result"] = detach_output(result)
                     
                     return result
         
@@ -358,13 +344,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             state["compute_times"].append(elapsed)
             
             # Cache result - handle tuple (h, audio_h)
-            if isinstance(result, tuple):
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result.detach() if isinstance(result, torch.Tensor) else result
+            state["last_result"] = detach_output(result)
             
             return result
         
@@ -386,15 +366,8 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             cached_result = state["last_result"]
             
             # Apply noise injection for temporal consistency
-            if noise_scale > 0 and isinstance(cached_result, tuple):
-                noised = []
-                for r in cached_result:
-                    if isinstance(r, torch.Tensor):
-                        noise = torch.randn_like(r) * noise_scale
-                        noised.append(r + noise)
-                    else:
-                        noised.append(r)
-                cached_result = tuple(noised)
+            if noise_scale > 0:
+                cached_result = apply_noise_injection(cached_result, noise_scale)
             
             return cached_result
         else:
@@ -408,13 +381,7 @@ def _enable_ltx2_cache(transformer, config: LTX2CacheConfig):
             state["compute_times"].append(elapsed)
             
             # Update cache
-            if isinstance(result, tuple):
-                state["last_result"] = tuple(
-                    r.detach() if isinstance(r, torch.Tensor) else r
-                    for r in result
-                )
-            else:
-                state["last_result"] = result.detach() if isinstance(result, torch.Tensor) else result
+            state["last_result"] = detach_output(result)
             
             return result
     
@@ -590,6 +557,14 @@ def _ltx2_outer_sample_wrapper(executor, *args, **kwargs):
             guider.model_options = orig_model_options
         except:
             pass
+        # CRITICAL: Clean up monkey-patched forward on transformer to prevent memory leak and recursion
+        if transformer is not None and hasattr(transformer, '_original_forward'):
+            try:
+                transformer.forward = transformer._original_forward
+                delattr(transformer, '_original_forward')
+                logger.info(f"[LTX2-Cache] Cleaned up transformer {id(transformer)} on sampling exit")
+            except Exception as e:
+                logger.warning(f"[LTX2-Cache] Cleanup on sampling exit failed: {e}")
 
 
 class CacheDiT_LTX2_Optimizer:
@@ -676,7 +651,7 @@ class CacheDiT_LTX2_Optimizer:
             diffusion_model = model.model.diffusion_model
             model_class_name = diffusion_model.__class__.__name__
             
-            if model_class_name != "LTXAVModel":
+            if "LTX" not in model_class_name and "ltx" not in diffusion_model.__class__.__module__.lower():
                 logger.warning(
                     f"[LTX2-Cache] Not LTX-2 model (detected: {model_class_name}), "
                     "optimization skipped"
@@ -777,7 +752,9 @@ class CacheDiT_LTX2_Optimizer:
             del model.model_options["transformer_options"]["ltx2_cache"]
         
         # Remove wrapper
-        if "ltx2_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
+        if hasattr(model, "remove_wrappers_with_key"):
+            model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "ltx2_cache")
+        elif "ltx2_cache" in model.wrappers.get(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, {}):
             del model.wrappers[comfy.patcher_extension.WrappersMP.OUTER_SAMPLE]["ltx2_cache"]
         
         # Restore original forward and clear cache state
